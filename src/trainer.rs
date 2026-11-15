@@ -1,7 +1,7 @@
 //! Training im Hintergrund-Thread. Die Oberfläche liest den Zustand über
 //! `Shared` und steuert über die Atomics in `Control`.
 
-use crate::data::{self, Dataset, DatasetKind, Norm, PIX};
+use crate::data::{self, Augment, DataSpec, Dataset, Norm};
 use crate::nn::{self, ActStat, Init, LayerSpec, LossKind, Model, OptCfg, OptKind, Shape};
 use crate::rng::Rng;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -30,10 +30,10 @@ impl Schedule {
 
 #[derive(Clone, Debug)]
 pub struct TrainConfig {
-    pub dataset: DatasetKind,
+    pub dataset: DataSpec,
     pub train_size: usize,
     pub norm: Norm,
-    pub shift: usize,
+    pub aug: Augment,
     pub layers: Vec<LayerSpec>,
     pub init: Init,
     pub loss: LossKind,
@@ -57,10 +57,10 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
-            dataset: DatasetKind::Mnist,
+            dataset: DataSpec::mnist(),
             train_size: 60_000,
             norm: Norm::Standard,
-            shift: 0,
+            aug: Augment::default(),
             layers: vec![LayerSpec::Dense { units: 128 }, LayerSpec::Act(nn::ActKind::ReLU)],
             init: Init::He,
             loss: LossKind::CrossEntropy,
@@ -105,7 +105,8 @@ impl TrainConfig {
     }
 
     pub fn input_shape(&self) -> Shape {
-        Shape::new(1, data::SIDE, data::SIDE)
+        let (c, h, w) = self.dataset.shape();
+        Shape::new(c, h, w)
     }
 }
 
@@ -125,7 +126,7 @@ pub enum Status {
 pub struct Eval {
     pub loss: f32,
     pub acc: f32,
-    pub confusion: Vec<[u32; 10]>,
+    pub confusion: Vec<Vec<u32>>,
     /// (Testindex, Vorhersage, Wahrheit, Konfidenz der Vorhersage)
     pub wrong: Vec<(usize, u8, u8, f32)>,
 }
@@ -262,13 +263,13 @@ impl Trainer {
 }
 
 /// Lädt den Datensatz (oder nimmt den bereits geladenen).
-pub fn ensure_data(kind: DatasetKind, data: &Mutex<Option<Arc<Dataset>>>, progress: &dyn Fn(String)) -> Result<Arc<Dataset>, String> {
+pub fn ensure_data(spec: &DataSpec, data: &Mutex<Option<Arc<Dataset>>>, progress: &dyn Fn(String)) -> Result<Arc<Dataset>, String> {
     if let Some(d) = data.lock().unwrap().as_ref() {
-        if d.kind == kind {
+        if d.spec == *spec {
             return Ok(d.clone());
         }
     }
-    let d = Arc::new(data::load(kind, progress)?);
+    let d = Arc::new(data::load(spec, progress)?);
     *data.lock().unwrap() = Some(d.clone());
     Ok(d)
 }
@@ -278,13 +279,15 @@ fn run(cfg: &TrainConfig, shared: &Mutex<Shared>, ctl: &Control, data: &Mutex<Op
         shared.lock().unwrap().status = st;
         repaint();
     };
-    let ds = ensure_data(cfg.dataset, data, &|m| set_status(Status::Loading(m)))?;
+    let ds = ensure_data(&cfg.dataset, data, &|m| set_status(Status::Loading(m)))?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(cfg.threads.max(1)).build().map_err(|e| e.to_string())?;
     pool.install(|| train(cfg, &ds, shared, ctl, repaint))
 }
 
 fn train(cfg: &TrainConfig, ds: &Dataset, shared: &Mutex<Shared>, ctl: &Control, repaint: &(dyn Fn() + Sync)) -> Result<bool, String> {
-    let mut model = Model::build(&cfg.layers, cfg.input_shape(), 10, cfg.init, cfg.seed)?;
+    let k = ds.n_classes();
+    let il = ds.img_len();
+    let mut model = Model::build(&cfg.layers, cfg.input_shape(), k, cfg.init, cfg.seed)?;
     let mut rng = Rng::new(cfg.seed ^ 0xA5A5_5A5A);
     let n_train = cfg.train_size.clamp(cfg.batch.max(1), ds.n_train());
     // Feste Teilmenge des Trainingssets (reproduzierbar über den Seed)
@@ -314,7 +317,7 @@ fn train(cfg: &TrainConfig, ds: &Dataset, shared: &Mutex<Shared>, ctl: &Control,
     }
     repaint();
 
-    let mut x = vec![0.0f32; bs * PIX];
+    let mut x = vec![0.0f32; bs * il];
     let mut y = vec![0u8; bs];
     let mut t: u64 = 0;
     let mut active = Duration::ZERO;
@@ -350,13 +353,13 @@ fn train(cfg: &TrainConfig, ds: &Dataset, shared: &Mutex<Shared>, ctl: &Control,
             }
             let t0 = Instant::now();
             let b = chunk.len();
-            for (k, &i) in chunk.iter().enumerate() {
-                data::prepare(ds.train_image(i), &mut x[k * PIX..][..PIX], cfg.norm, cfg.dataset, cfg.shift, Some(&mut rng));
-                y[k] = ds.train_y[i];
+            for (j, &i) in chunk.iter().enumerate() {
+                data::prepare(ds.train_image(i), &mut x[j * il..][..il], ds, cfg.norm, cfg.aug, Some(&mut rng));
+                y[j] = ds.train_y[i];
             }
             let collect = t % 10 == 0;
-            let logits = model.forward(&x[..b * PIX], b, true, if collect { Some(&mut stats) } else { None });
-            let (loss, correct, grad) = nn::loss_grad(&logits, &y[..b], 10, cfg.loss, cfg.smoothing);
+            let logits = model.forward(&x[..b * il], b, true, if collect { Some(&mut stats) } else { None });
+            let (loss, correct, grad) = nn::loss_grad(&logits, &y[..b], k, cfg.loss, cfg.smoothing);
             if !loss.is_finite() {
                 return Err(format!("Der Verlust ist in Schritt {t} explodiert (NaN/∞). Lernrate zu hoch? Gradient Clipping probieren."));
             }
@@ -458,29 +461,30 @@ fn train(cfg: &TrainConfig, ds: &Dataset, shared: &Mutex<Shared>, ctl: &Control,
 /// Wertet das Modell auf den angegebenen Testbildern aus (ohne Dropout, BN im Inferenzmodus).
 pub fn evaluate(model: &mut Model, ds: &Dataset, idx: &[usize], cfg: &TrainConfig, full: bool) -> Eval {
     let bs = 500;
-    let mut x = vec![0.0f32; bs * PIX];
-    let mut conf = vec![[0u32; 10]; 10];
+    let (k, il) = (ds.n_classes(), ds.img_len());
+    let mut x = vec![0.0f32; bs * il];
+    let mut conf = vec![vec![0u32; k]; k];
     let mut wrong = Vec::new();
     let (mut loss, mut correct) = (0.0f64, 0usize);
-    let mut p = [0.0f32; 10];
+    let mut p = vec![0.0f32; k];
     for chunk in idx.chunks(bs) {
         let b = chunk.len();
         let mut y = Vec::with_capacity(b);
-        for (k, &i) in chunk.iter().enumerate() {
-            data::prepare(ds.test_image(i), &mut x[k * PIX..][..PIX], cfg.norm, cfg.dataset, 0, None);
+        for (j, &i) in chunk.iter().enumerate() {
+            data::prepare(ds.test_image(i), &mut x[j * il..][..il], ds, cfg.norm, Augment::default(), None);
             y.push(ds.test_y[i]);
         }
-        let z = model.forward(&x[..b * PIX], b, false, None);
-        let (l, c, _) = nn::loss_grad(&z, &y, 10, cfg.loss, 0.0);
+        let z = model.forward(&x[..b * il], b, false, None);
+        let (l, c, _) = nn::loss_grad(&z, &y, k, cfg.loss, 0.0);
         loss += l as f64 * b as f64;
         correct += c;
         if full {
-            for (k, &i) in chunk.iter().enumerate() {
-                nn::softmax(&z[k * 10..][..10], &mut p);
-                let pred = (0..10).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
-                conf[y[k] as usize][pred] += 1;
-                if pred != y[k] as usize {
-                    wrong.push((i, pred as u8, y[k], p[pred]));
+            for (j, &i) in chunk.iter().enumerate() {
+                nn::softmax(&z[j * k..][..k], &mut p);
+                let pred = (0..k).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
+                conf[y[j] as usize][pred] += 1;
+                if pred != y[j] as usize {
+                    wrong.push((i, pred as u8, y[j], p[pred]));
                 }
             }
         }

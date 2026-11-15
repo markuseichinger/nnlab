@@ -96,9 +96,32 @@ pub fn vector(vals: &[f32], cols: usize, scale: Scale) -> ColorImage {
     ColorImage::new([cols, rows], px)
 }
 
-/// Graustufenbild 28×28 aus u8.
-pub fn digit(img: &[u8], side: usize) -> ColorImage {
-    ColorImage::new([side, side], img.iter().map(|&p| gray(p as f32 / 255.0)).collect())
+/// Ein Bild aus dem Datensatz (planar C×H×W, u8): Graustufen oder RGB.
+pub fn sample(img: &[u8], c: usize, h: usize, w: usize) -> ColorImage {
+    let n = h * w;
+    let px = (0..n)
+        .map(|i| if c >= 3 { Color32::from_rgb(img[i], img[n + i], img[2 * n + i]) } else { Color32::from_gray(img[i]) })
+        .collect();
+    ColorImage::new([w, h], px)
+}
+
+/// Kacheln aus RGB-Gewichten: Jeder Kanal wird um 0,5 grau zentriert dargestellt.
+pub fn rgb_tiles(n: usize, tw: usize, th: usize, cols: usize, max: impl Fn(usize) -> f32, value: impl Fn(usize, usize, usize, usize) -> f32) -> ColorImage {
+    let cols = cols.clamp(1, n.max(1));
+    let rows = n.div_ceil(cols).max(1);
+    let (w, h) = (cols * (tw + 1) + 1, rows * (th + 1) + 1);
+    let mut px = vec![GAP; w * h];
+    for t in 0..n {
+        let (ox, oy) = (1 + (t % cols) * (tw + 1), 1 + (t / cols) * (th + 1));
+        let m = max(t).max(1e-8);
+        for y in 0..th {
+            for x in 0..tw {
+                let ch = |c: usize| ((0.5 + 0.5 * value(t, c, x, y) / m).clamp(0.0, 1.0) * 255.0) as u8;
+                px[(oy + y) * w + ox + x] = Color32::from_rgb(ch(0), ch(1), ch(2));
+            }
+        }
+    }
+    ColorImage::new([w, h], px)
 }
 
 /// Exponentiell geglättete Kurve, auf höchstens `max_pts` Punkte ausgedünnt.

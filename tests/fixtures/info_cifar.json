@@ -1,0 +1,1 @@
+{"dataset_info":{"plain_text":{"description":"","citation":"","features":{"img":{"_type":"Image"},"label":{"names":["airplane","automobile","bird","cat","deer","dog","frog","horse","ship","truck"],"_type":"ClassLabel"}},"splits":{"train":{"name":"train","num_examples":50000},"test":{"name":"test","num_examples":10000}}}},"pending":[],"failed":[],"partial":false}

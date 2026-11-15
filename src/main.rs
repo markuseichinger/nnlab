@@ -1,22 +1,27 @@
 //! nnlab: neuronale Netze konfigurieren, trainieren und beim Lernen zusehen.
 
+mod advisor;
 mod draw;
+mod presets;
+mod tutorial;
 mod viz;
 
+use advisor::{Advice, DataInfo, Level};
 use eframe::egui::{self, Color32, ColorImage, RichText, Sense, TextureHandle, TextureOptions};
 use egui_plot::{Bar, BarChart, HLine, Legend, Line, Plot, PlotPoints, Points};
-use nnlab::data::{self, Dataset, DatasetKind, Norm, PIX, SIDE};
-use nnlab::nn::{self, ActKind, Init, Layer, LayerSpec, LossKind, Model, OptKind};
+use nnlab::data::{self, Augment, DataSpec, Dataset, Norm, Source, HF_SUGGESTIONS};
+use nnlab::nn::{self, ActKind, Init, Layer, LayerSpec, LossKind, Model, OptKind, Shape};
 use nnlab::trainer::{self, Schedule, Status, TrainConfig, Trainer};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tutorial::Topic;
 
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("nnlab – Neuronale Netze trainieren").with_inner_size([1560.0, 980.0]).with_min_inner_size([1100.0, 700.0]),
+        viewport: egui::ViewportBuilder::default().with_title("nnlab – Neuronale Netze trainieren").with_inner_size([1680.0, 1000.0]).with_min_inner_size([1150.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native("nnlab", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
@@ -26,6 +31,7 @@ const ACCENT: Color32 = Color32::from_rgb(255, 150, 50);
 const BLUE: Color32 = Color32::from_rgb(70, 160, 255);
 const GREEN: Color32 = Color32::from_rgb(120, 209, 81);
 const RED: Color32 = Color32::from_rgb(240, 90, 80);
+const VIOLET: Color32 = Color32::from_rgb(160, 120, 255);
 const MUTED: Color32 = Color32::from_rgb(140, 145, 155);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,6 +42,7 @@ enum Tab {
     Dynamik,
     Auswertung,
     Zeichnen,
+    Berater,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,57 +86,48 @@ fn image(ui: &mut egui::Ui, t: &TextureHandle, w: f32, h: f32) -> egui::Response
     ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(w, h))))
 }
 
-struct Preset {
-    name: &'static str,
-    info: &'static str,
-    layers: Vec<LayerSpec>,
-    opt: Option<(OptKind, f32, Init)>,
+/// Setzt das Tutorial-Thema, wenn das Bedienelement angeklickt oder verändert wurde.
+fn tp(slot: &mut Topic, r: egui::Response, t: Topic) -> egui::Response {
+    if r.clicked() || r.drag_started() || r.gained_focus() || r.changed() {
+        *slot = t;
+    }
+    r
 }
 
-fn presets() -> Vec<Preset> {
-    use ActKind::*;
-    use LayerSpec::*;
-    vec![
-        Preset { name: "Softmax-Regression", info: "Keine verdeckte Schicht: ein lineares Modell, ca. 92 %.", layers: vec![], opt: None },
-        Preset { name: "MLP 128 ReLU", info: "Der Klassiker: eine verdeckte Schicht, ca. 98 %.", layers: vec![Dense { units: 128 }, Act(ReLU)], opt: None },
-        Preset {
-            name: "MLP 2×256 + Dropout",
-            info: "Breiter und tiefer, mit Dropout gegen Overfitting.",
-            layers: vec![Dense { units: 256 }, Act(ReLU), Dropout { p: 0.2 }, Dense { units: 256 }, Act(ReLU), Dropout { p: 0.2 }],
-            opt: None,
-        },
-        Preset {
-            name: "Tiefes Sigmoid-MLP (Vanishing Gradients)",
-            info: "6× Sigmoid mit SGD: Im Tab „Gradienten-Dynamik“ werden die Gradienten zur Eingabe hin immer kleiner. Danach ReLU oder BatchNorm einsetzen und vergleichen.",
-            layers: [Dense { units: 64 }, Act(Sigmoid)].repeat(6),
-            opt: Some((OptKind::Sgd, 0.1, Init::Xavier)),
-        },
-        Preset {
-            name: "CNN (LeNet-artig)",
-            info: "Zwei Faltungsblöcke mit Pooling, dann Dense. Ca. 99 %.",
-            layers: vec![Conv { filters: 8, k: 5, same: true }, Act(ReLU), MaxPool { size: 2 }, Conv { filters: 16, k: 5, same: true }, Act(ReLU), MaxPool { size: 2 }, Dense { units: 64 }, Act(ReLU)],
-            opt: None,
-        },
-        Preset {
-            name: "CNN + BatchNorm + Dropout",
-            info: "Moderner kleiner CNN. Rechenintensiv: gut geeignet, um die CPU-Last zu sehen.",
-            layers: vec![
-                Conv { filters: 16, k: 3, same: true },
-                BatchNorm,
-                Act(ReLU),
-                MaxPool { size: 2 },
-                Conv { filters: 32, k: 3, same: true },
-                BatchNorm,
-                Act(ReLU),
-                MaxPool { size: 2 },
-                Dense { units: 128 },
-                BatchNorm,
-                Act(ReLU),
-                Dropout { p: 0.3 },
-            ],
-            opt: None,
-        },
-    ]
+/// Anklickbare Beschriftung, die ein Tutorial-Thema setzt.
+fn tlabel(ui: &mut egui::Ui, slot: &mut Topic, text: impl Into<egui::WidgetText>, t: Topic) {
+    let r = ui.add(egui::Label::new(text).sense(Sense::click()));
+    tp(slot, r.on_hover_cursor(egui::CursorIcon::Help), t);
+}
+
+fn opt_topic(k: OptKind) -> Topic {
+    match k {
+        OptKind::Sgd => Topic::Sgd,
+        OptKind::Momentum | OptKind::Nesterov => Topic::Momentum,
+        OptKind::RmsProp => Topic::RmsProp,
+        OptKind::Adam | OptKind::AdamW => Topic::Adam,
+    }
+}
+
+fn layer_topic(l: &LayerSpec) -> Topic {
+    match l {
+        LayerSpec::Dense { .. } => Topic::Dense,
+        LayerSpec::Conv { .. } => Topic::Conv,
+        LayerSpec::MaxPool { .. } => Topic::MaxPool,
+        LayerSpec::Act(_) => Topic::Activation,
+        LayerSpec::Dropout { .. } => Topic::Dropout,
+        LayerSpec::BatchNorm => Topic::BatchNorm,
+    }
+}
+
+pub fn fmt_n(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2} M", n as f64 / 1e6)
+    } else if n >= 10_000 {
+        format!("{:.1} k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 struct App {
@@ -144,14 +142,19 @@ struct App {
     log_loss: bool,
     sel_layer: usize,
     preview: Result<Arc<Model>, String>,
-    preview_key: Option<(Vec<LayerSpec>, Init, u64)>,
+    preview_key: Option<(Vec<LayerSpec>, Init, u64, (usize, usize, usize), usize)>,
     preview_ver: u64,
     trace: Option<Trace>,
     load_msg: Arc<Mutex<String>>,
     loading: Arc<AtomicBool>,
     lr_factor: f32,
     cores: usize,
-    preset_info: Option<&'static str>,
+    info_line: Option<String>,
+    topic: Topic,
+    show_tutorial: bool,
+    hf_id: String,
+    hf_side: usize,
+    hf_rgb: bool,
 }
 
 impl App {
@@ -177,7 +180,12 @@ impl App {
             loading: Arc::new(AtomicBool::new(false)),
             lr_factor: 1.0,
             cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
-            preset_info: None,
+            info_line: None,
+            topic: Topic::Welcome,
+            show_tutorial: true,
+            hf_id: String::new(),
+            hf_side: 32,
+            hf_rgb: true,
         };
         app.ensure_data();
         app
@@ -187,18 +195,31 @@ impl App {
         self.tr.data.lock().unwrap().clone()
     }
 
+    /// Der geladene Datensatz, falls er zur aktuellen Auswahl passt.
+    fn current_data(&self) -> Option<Arc<Dataset>> {
+        self.dataset().filter(|d| d.spec == self.cfg.dataset)
+    }
+
+    fn set_dataset(&mut self, spec: DataSpec) {
+        if spec != self.cfg.dataset {
+            self.cfg.dataset = spec;
+            self.load_msg.lock().unwrap().clear();
+            self.probe = Probe::Test(0);
+        }
+    }
+
     /// Lädt den gewählten Datensatz im Hintergrund, falls nötig.
     fn ensure_data(&mut self) {
-        if self.dataset().is_some_and(|d| d.kind == self.cfg.dataset) || self.loading.load(Ordering::SeqCst) || self.tr.running() {
+        if self.current_data().is_some() || self.loading.load(Ordering::SeqCst) || self.tr.running() {
             return;
         }
         if self.load_msg.lock().unwrap().starts_with("Fehler") {
             return;
         }
         self.loading.store(true, Ordering::SeqCst);
-        let (data, msg, loading, ctx, kind) = (self.tr.data.clone(), self.load_msg.clone(), self.loading.clone(), self.ctx.clone(), self.cfg.dataset);
+        let (data, msg, loading, ctx, spec) = (self.tr.data.clone(), self.load_msg.clone(), self.loading.clone(), self.ctx.clone(), self.cfg.dataset.clone());
         std::thread::spawn(move || {
-            let r = trainer::ensure_data(kind, &data, &|m| {
+            let r = trainer::ensure_data(&spec, &data, &|m| {
                 *msg.lock().unwrap() = m;
                 ctx.request_repaint();
             });
@@ -211,10 +232,14 @@ impl App {
         });
     }
 
+    fn n_classes(&self) -> usize {
+        self.current_data().map(|d| d.n_classes()).unwrap_or(10)
+    }
+
     fn update_preview(&mut self) {
-        let key = (self.cfg.layers.clone(), self.cfg.init, self.cfg.seed);
+        let key = (self.cfg.layers.clone(), self.cfg.init, self.cfg.seed, self.cfg.dataset.shape(), self.n_classes());
         if self.preview_key.as_ref() != Some(&key) {
-            self.preview = Model::build(&self.cfg.layers, self.cfg.input_shape(), 10, self.cfg.init, self.cfg.seed).map(Arc::new);
+            self.preview = Model::build(&self.cfg.layers, self.cfg.input_shape(), key.4, self.cfg.init, self.cfg.seed).map(Arc::new);
             self.preview_key = Some(key);
             self.preview_ver += 1;
         }
@@ -252,35 +277,52 @@ impl App {
     }
 
     /// Vorwärtslauf für das gewählte Sample (zwischengespeichert).
-    fn trace(&mut self) -> Option<(&Trace, Arc<Model>, TrainConfig, bool)> {
-        let (model, ver, cfg, trained) = self.model()?;
-        let ds = self.dataset();
-        if self.probe != Probe::Drawing && ds.is_none() {
-            return None;
+    fn trace(&mut self) -> Result<(&Trace, Arc<Model>, TrainConfig, bool, Arc<Dataset>), String> {
+        let (model, ver, cfg, trained) = self.model().ok_or("Kein gültiges Netz (siehe Architektur).")?;
+        let ds = self.dataset().filter(|d| d.spec == cfg.dataset).ok_or_else(|| {
+            if trained {
+                format!("Das Modell wurde auf „{}“ trainiert, dieser Datensatz ist gerade nicht geladen. Zurücksetzen oder neu trainieren.", cfg.dataset.label())
+            } else {
+                "Datensatz wird geladen …".to_string()
+            }
+        })?;
+        if self.probe == Probe::Drawing && model.input != Shape::new(1, 28, 28) {
+            return Err("Zeichnungen gibt es nur für Netze mit 1×28×28-Eingabe.".into());
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (ver, self.probe, cfg.norm as u8, ds.as_ref().map(|d| d.kind as u8)).hash(&mut h);
+        (ver, self.probe, cfg.norm as u8, &ds.spec).hash(&mut h);
         if self.probe == Probe::Drawing {
             self.canvas.version.hash(&mut h);
         }
         let key = h.finish();
         if self.trace.as_ref().map(|t| t.key) != Some(key) {
             let img = match self.probe {
-                Probe::Test(i) => {
-                    let d = ds.as_ref()?;
-                    d.test_image(i.min(d.n_test() - 1)).to_vec()
-                }
+                Probe::Test(i) => ds.test_image(i.min(ds.n_test() - 1)).to_vec(),
                 Probe::Drawing => self.canvas.to_mnist(),
             };
-            let mut input = vec![0.0; PIX];
-            data::prepare(&img, &mut input, cfg.norm, cfg.dataset, 0, None);
+            let mut input = vec![0.0; ds.img_len()];
+            data::prepare(&img, &mut input, &ds, cfg.norm, Augment::default(), None);
             let mut m = (*model).clone();
             let outs = m.forward_trace(&input);
-            let mut probs = vec![0.0; 10];
-            nn::softmax(outs.last()?, &mut probs);
+            let z = outs.last().ok_or("leeres Netz")?;
+            let mut probs = vec![0.0; z.len()];
+            nn::softmax(z, &mut probs);
             self.trace = Some(Trace { key, img, input, outs, probs });
         }
-        Some((self.trace.as_ref()?, model, cfg, trained))
+        Ok((self.trace.as_ref().unwrap(), model, cfg, trained, ds))
+    }
+
+    fn data_info(&self) -> DataInfo {
+        let d = self.current_data();
+        DataInfo { kind: self.cfg.dataset.kind(), shape: self.cfg.dataset.shape(), n_train: d.as_ref().map(|d| d.n_train()), classes: d.as_ref().map(|d| d.n_classes()) }
+    }
+
+    fn apply_recipe(&mut self, name: &str) {
+        if let Some(r) = presets::recipes().into_iter().find(|r| r.name == name) {
+            (r.apply)(&mut self.cfg);
+            self.info_line = Some(format!("Voreinstellung „{}“ übernommen. {}", r.name, r.info));
+            self.topic = Topic::Recipes;
+        }
     }
 }
 
@@ -291,20 +333,27 @@ impl eframe::App for App {
             self.ensure_data();
         }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::left("cfg").resizable(true).default_size(390.0).min_size(330.0).show(ui, |ui| {
+        egui::Panel::left("cfg").resizable(true).default_size(400.0).min_size(340.0).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.config_ui(ui));
         });
+        if self.show_tutorial {
+            egui::Panel::right("tutorial").resizable(true).default_size(380.0).min_size(300.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("tut").auto_shrink(false).show(ui, |ui| self.tutorial_ui(ui));
+            });
+        }
         egui::CentralPanel::default_margins().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (t, name) in [
-                    (Tab::Verlauf, "📈 Verlauf"),
-                    (Tab::Netz, "🔍 Netz & Aktivierungen"),
-                    (Tab::Gewichte, "▦ Gewichte"),
-                    (Tab::Dynamik, "〰 Gradienten-Dynamik"),
-                    (Tab::Auswertung, "🎯 Auswertung"),
-                    (Tab::Zeichnen, "✏ Zeichnen"),
+            ui.horizontal_wrapped(|ui| {
+                for (t, name, topic) in [
+                    (Tab::Verlauf, "📈 Verlauf", Topic::ViewLoss),
+                    (Tab::Netz, "🔍 Netz & Aktivierungen", Topic::ViewActivations),
+                    (Tab::Gewichte, "▦ Gewichte", Topic::ViewWeights),
+                    (Tab::Dynamik, "〰 Gradienten-Dynamik", Topic::ViewGradNorm),
+                    (Tab::Auswertung, "🎯 Auswertung", Topic::ViewConfusion),
+                    (Tab::Zeichnen, "✏ Zeichnen", Topic::ViewDrawing),
+                    (Tab::Berater, "🧭 Berater", Topic::Advisor),
                 ] {
-                    ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
+                    let r = ui.selectable_value(&mut self.tab, t, RichText::new(name).size(15.0));
+                    tp(&mut self.topic, r, topic);
                 }
             });
             ui.separator();
@@ -315,6 +364,7 @@ impl eframe::App for App {
                 Tab::Dynamik => self.tab_dynamik(ui),
                 Tab::Auswertung => self.tab_auswertung(ui),
                 Tab::Zeichnen => self.tab_zeichnen(ui),
+                Tab::Berater => self.tab_berater(ui),
             }
         });
     }
@@ -373,11 +423,12 @@ impl App {
             ui.add_space(10.0);
             let big = |t: &str| egui::Button::new(RichText::new(t).size(15.0));
             if !running {
-                let ok = self.preview.is_ok() && !self.loading.load(Ordering::SeqCst);
+                let ok = self.preview.is_ok() && self.current_data().is_some();
                 if ui.add_enabled(ok, big("▶ Training starten")).on_hover_text("Baut das Netz neu (mit dem Seed) und trainiert.").clicked() {
                     self.start(false);
                 }
-                if ui.add_enabled(ok, big("⏭ Schrittweise")).on_hover_text("Startet pausiert. Dann trainiert jeder Klick auf „⏭ 1“ genau einen Batch.").clicked() {
+                let r = ui.add_enabled(ok, big("⏭ Schrittweise")).on_hover_text("Startet pausiert. Dann trainiert jeder Klick auf „⏭ 1“ genau einen Batch.");
+                if tp(&mut self.topic, r, Topic::StepMode).clicked() {
                     self.start(true);
                 }
                 if i.has_model && ui.add(big("↺ Zurücksetzen")).on_hover_text("Trainiertes Modell und Verlauf verwerfen.").clicked() {
@@ -389,7 +440,8 @@ impl App {
                         self.tr.ctl.pause.store(false, Ordering::SeqCst);
                     }
                     for n in [1u32, 10, 100] {
-                        if ui.add(big(&format!("⏭ {n}"))).on_hover_text(format!("{n} Batch(es) trainieren")).clicked() {
+                        let r = ui.add(big(&format!("⏭ {n}"))).on_hover_text(format!("{n} Batch(es) trainieren"));
+                        if tp(&mut self.topic, r, Topic::StepMode).clicked() {
                             self.tr.ctl.steps.fetch_add(n, Ordering::SeqCst);
                         }
                     }
@@ -400,21 +452,26 @@ impl App {
                     self.tr.stop();
                 }
                 ui.separator();
-                ui.label("Lernraten-Faktor live:");
-                if ui.add(egui::Slider::new(&mut self.lr_factor, 0.01..=10.0).logarithmic(true).fixed_decimals(2)).on_hover_text("Multipliziert die Lernrate sofort, ohne Neustart.").changed() {
+                tlabel(ui, &mut self.topic, "Lernraten-Faktor live:", Topic::LiveLr);
+                let r = ui.add(egui::Slider::new(&mut self.lr_factor, 0.01..=10.0).logarithmic(true).fixed_decimals(2)).on_hover_text("Multipliziert die Lernrate sofort, ohne Neustart.");
+                if tp(&mut self.topic, r, Topic::LiveLr).changed() {
                     self.tr.ctl.lr_scale_milli.store((self.lr_factor * 1000.0) as u32, Ordering::SeqCst);
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.show_tutorial { "🎓 Tutorial an" } else { "🎓 Tutorial" };
+                if ui.add(egui::Button::new(RichText::new(label).size(15.0)).selected(self.show_tutorial)).on_hover_text("Erklärungen zu jedem Parameter: einfach anklicken.").clicked() {
+                    self.show_tutorial = !self.show_tutorial;
+                }
+                ui.separator();
                 let mut d = self.tr.ctl.delay_ms.load(Ordering::Relaxed) as f32;
-                if ui
-                    .add(egui::Slider::new(&mut d, 0.0..=500.0).text("ms").custom_formatter(|v, _| if v < 1.0 { "aus".into() } else { format!("{v:.0}") }))
-                    .on_hover_text("Pause nach jedem Trainingsschritt, um dem Netz beim Lernen zuzusehen. Zählt nicht zur Rechenzeit.")
-                    .changed()
-                {
+                let r = ui
+                    .add(egui::Slider::new(&mut d, 0.0..=500.0).custom_formatter(|v, _| if v < 1.0 { "aus".into() } else { format!("{v:.0} ms") }))
+                    .on_hover_text("Pause nach jedem Trainingsschritt, um dem Netz beim Lernen zuzusehen. Zählt nicht zur Rechenzeit.");
+                if tp(&mut self.topic, r, Topic::SlowMo).changed() {
                     self.tr.ctl.delay_ms.store(d as u32, Ordering::Relaxed);
                 }
-                ui.label("🐢 Zeitlupe");
+                tlabel(ui, &mut self.topic, "🐢 Zeitlupe", Topic::SlowMo);
             });
         });
         ui.horizontal_wrapped(|ui| {
@@ -430,47 +487,38 @@ impl App {
             ui.label(RichText::new(txt).color(col).strong());
             let lm = self.load_msg.lock().unwrap().clone();
             if !lm.is_empty() && !running {
-                ui.label(RichText::new(lm).color(if self.loading.load(Ordering::SeqCst) { BLUE } else { RED }));
+                ui.label(RichText::new(lm.lines().next().unwrap_or("")).color(if self.loading.load(Ordering::SeqCst) { BLUE } else { RED }));
             }
             if i.spe > 0 {
                 let in_ep = (i.step as usize).saturating_sub(i.epoch * i.spe).min(i.spe);
                 let frac = ((i.epoch as f32 + in_ep as f32 / i.spe as f32) / i.epochs.max(1) as f32).min(1.0);
                 ui.add(egui::ProgressBar::new(frac).desired_width(150.0).text(format!("Epoche {}/{}", (i.epoch + 1).min(i.epochs), i.epochs)));
-                let m = |ui: &mut egui::Ui, k: &str, v: String| {
-                    ui.label(RichText::new(k).color(MUTED));
+                let topic = &mut self.topic;
+                let mut m = |ui: &mut egui::Ui, k: &str, v: String, t: Topic| {
+                    tlabel(ui, topic, RichText::new(k).color(MUTED), t);
                     ui.label(RichText::new(v).strong().monospace());
                 };
-                m(ui, "Schritt", format!("{}", i.step));
+                m(ui, "Schritt", format!("{}", i.step), Topic::BatchSize);
                 if let Some(l) = i.loss {
-                    m(ui, "Verlust", format!("{l:.4}"));
+                    m(ui, "Verlust", format!("{l:.4}"), Topic::ViewLoss);
                 }
                 if let Some(a) = i.acc {
-                    m(ui, "Train", format!("{:.2} %", a * 100.0));
+                    m(ui, "Train", format!("{:.2} %", a * 100.0), Topic::ViewAcc);
                 }
                 if let Some(a) = i.val_acc {
-                    m(ui, "Test", format!("{:.2} %", a * 100.0));
+                    m(ui, "Test", format!("{:.2} %", a * 100.0), Topic::ViewAcc);
                 }
                 ui.separator();
-                m(ui, "Durchsatz", format!("{:.0} Bilder/s", i.sps));
-                m(ui, "Leistung", format!("{:.1} GFLOP/s", i.gflops));
-                m(ui, "Threads", format!("{}", i.threads));
-                m(ui, "Rechenzeit", format!("{:.1} s", i.elapsed.as_secs_f32()));
+                m(ui, "Durchsatz", format!("{:.0} Bilder/s", i.sps), Topic::Throughput);
+                m(ui, "Leistung", format!("{:.1} GFLOP/s", i.gflops), Topic::Throughput);
+                m(ui, "Threads", format!("{}", i.threads), Topic::Threads);
+                m(ui, "Rechenzeit", format!("{:.1} s", i.elapsed.as_secs_f32()), Topic::Throughput);
                 ui.separator();
-                m(ui, "Parameter", fmt_n(i.n_params));
-                m(ui, "MACs/Bild", fmt_n(i.macs));
+                m(ui, "Parameter", fmt_n(i.n_params), Topic::Architecture);
+                m(ui, "MACs/Bild", fmt_n(i.macs), Topic::Architecture);
             }
         });
         ui.add_space(2.0);
-    }
-}
-
-fn fmt_n(n: usize) -> String {
-    if n >= 1_000_000 {
-        format!("{:.2} M", n as f64 / 1e6)
-    } else if n >= 10_000 {
-        format!("{:.1} k", n as f64 / 1e3)
-    } else {
-        n.to_string()
     }
 }
 
@@ -478,78 +526,235 @@ fn fmt_n(n: usize) -> String {
 // Konfiguration
 // ---------------------------------------------------------------------------
 
-fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, label: &str, v: &mut T, all: &[T], name: impl Fn(T) -> &'static str) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, label: &str, v: &mut T, all: &[T], name: impl Fn(T) -> &'static str, slot: &mut Topic, topic: Topic) -> bool {
     let before = *v;
     ui.horizontal(|ui| {
-        ui.label(label);
-        egui::ComboBox::from_id_salt(id).selected_text(name(*v)).width(220.0).show_ui(ui, |ui| {
+        tlabel(ui, slot, label, topic);
+        let r = egui::ComboBox::from_id_salt(id).selected_text(name(*v)).width(220.0).show_ui(ui, |ui| {
             for &o in all {
                 ui.selectable_value(v, o, name(o));
             }
         });
+        tp(slot, r.response, topic);
     });
     before != *v
+}
+
+/// Abschnitt mit anklickbarer Überschrift (setzt das Tutorial-Thema).
+fn section(ui: &mut egui::Ui, slot: &mut Topic, title: &str, topic: Topic, open: bool, body: impl FnOnce(&mut egui::Ui, &mut Topic)) {
+    let mut t = *slot;
+    let r = egui::CollapsingHeader::new(RichText::new(title).strong().size(14.5)).default_open(open).show(ui, |ui| body(ui, &mut t));
+    *slot = t;
+    if r.header_response.clicked() {
+        *slot = topic;
+    }
 }
 
 impl App {
     fn config_ui(&mut self, ui: &mut egui::Ui) {
         let running = self.tr.running();
         if running {
-            ui.label(RichText::new("Während des Trainings gesperrt (bis auf den Lernraten-Faktor oben).").color(MUTED).italics());
+            ui.label(RichText::new("Während des Trainings gesperrt (bis auf Lernraten-Faktor und Zeitlupe oben).").color(MUTED).italics());
+        }
+        // Kurzfassung des Beraters
+        let advice = advisor::check_config(&self.cfg, &self.data_info(), &self.preview, self.cores);
+        let (errs, warns) = (advice.iter().filter(|a| a.level == Level::Error).count(), advice.iter().filter(|a| a.level == Level::Warn).count());
+        let (txt, col) = match (errs, warns) {
+            (0, 0) => ("🧭 Berater: keine Probleme".to_string(), GREEN),
+            (0, w) => (format!("🧭 Berater: {w} Hinweis{} prüfen", if w == 1 { "" } else { "e" }), ACCENT),
+            (e, w) => (format!("🧭 Berater: {e} Fehler, {w} Warnung{}", if w == 1 { "" } else { "en" }), RED),
+        };
+        if ui.add(egui::Button::new(RichText::new(txt).color(col).strong()).frame(true)).on_hover_text("Öffnet den Berater mit Details und Korrekturen.").clicked() {
+            self.tab = Tab::Berater;
+            self.topic = Topic::Advisor;
+        }
+        if let Some(l) = &self.info_line {
+            ui.label(RichText::new(l).small().color(GREEN));
         }
         ui.add_enabled_ui(!running, |ui| {
-            egui::CollapsingHeader::new(RichText::new("Datensatz").strong()).default_open(true).show(ui, |ui| self.cfg_data(ui));
-            egui::CollapsingHeader::new(RichText::new("Architektur").strong()).default_open(true).show(ui, |ui| self.cfg_arch(ui));
-            egui::CollapsingHeader::new(RichText::new("Initialisierung & Verlust").strong()).default_open(true).show(ui, |ui| self.cfg_init(ui));
-            egui::CollapsingHeader::new(RichText::new("Optimierer").strong()).default_open(true).show(ui, |ui| self.cfg_opt(ui));
-            egui::CollapsingHeader::new(RichText::new("Lernraten-Plan").strong()).default_open(true).show(ui, |ui| self.cfg_sched(ui));
-            egui::CollapsingHeader::new(RichText::new("Training & Rechenleistung").strong()).default_open(true).show(ui, |ui| self.cfg_train(ui));
+            let mut topic = self.topic;
+            section(ui, &mut topic, "Voreinstellungen", Topic::Recipes, true, |ui, t| self.cfg_recipes(ui, t));
+            section(ui, &mut topic, "Datensatz", Topic::Dataset, true, |ui, t| self.cfg_data(ui, t));
+            section(ui, &mut topic, "Architektur", Topic::Architecture, true, |ui, t| self.cfg_arch(ui, t));
+            section(ui, &mut topic, "Initialisierung & Verlust", Topic::Init, true, |ui, t| self.cfg_init(ui, t));
+            section(ui, &mut topic, "Optimierer", Topic::Optimizer, true, |ui, t| self.cfg_opt(ui, t));
+            section(ui, &mut topic, "Lernraten-Plan", Topic::Schedule, true, |ui, t| self.cfg_sched(ui, t));
+            section(ui, &mut topic, "Training & Rechenleistung", Topic::Epochs, true, |ui, t| self.cfg_train(ui, t));
+            self.topic = topic;
         });
     }
 
-    fn cfg_data(&mut self, ui: &mut egui::Ui) {
-        let c = &mut self.cfg;
-        if combo(ui, "ds", "Daten:", &mut c.dataset, &[DatasetKind::Mnist, DatasetKind::Fashion], |d| d.name()) {
-            self.load_msg.lock().unwrap().clear();
-        }
+    fn cfg_recipes(&mut self, ui: &mut egui::Ui, t: &mut Topic) {
+        ui.label(RichText::new("Setzen die komplette Konfiguration (Datensatz und Threads bleiben).").small().color(MUTED));
+        let mut chosen = None;
         ui.horizontal(|ui| {
-            ui.label("Trainingsbeispiele:");
-            ui.add(egui::DragValue::new(&mut c.train_size).range(100..=60_000).speed(100));
-        })
-        .response
-        .on_hover_text("Kleine Mengen (z. B. 1000) zeigen Overfitting: Die Train-Genauigkeit geht gegen 100 %, die Test-Genauigkeit bleibt zurück.");
-        combo(ui, "norm", "Normierung:", &mut c.norm, &Norm::ALL, |n| n.name());
-        ui.add(egui::Slider::new(&mut c.shift, 0..=4).text("Augmentierung ±px"))
-            .on_hover_text("Verschiebt jedes Trainingsbild zufällig um bis zu so viele Pixel (Datenaugmentierung).");
-        ui.label(RichText::new(format!("Cache: {}", data::cache_dir().display())).small().color(MUTED));
-    }
-
-    fn cfg_arch(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Vorlage:");
-            egui::ComboBox::from_id_salt("preset").selected_text("auswählen …").width(250.0).show_ui(ui, |ui| {
-                for p in presets() {
-                    if ui.selectable_label(false, p.name).on_hover_text(p.info).clicked() {
-                        self.cfg.layers = p.layers.clone();
-                        if let Some((o, lr, init)) = p.opt {
-                            self.cfg.opt.kind = o;
-                            self.cfg.lr = lr;
-                            self.cfg.init = init;
-                        }
-                        self.preset_info = Some(p.info);
+            let r = egui::ComboBox::from_id_salt("recipe").selected_text("Empfohlen …").width(170.0).show_ui(ui, |ui| {
+                for r in presets::recipes().iter().filter(|r| r.group == presets::Group::Recommended) {
+                    if ui.selectable_label(false, r.name).on_hover_text(r.info).clicked() {
+                        chosen = Some(r.name);
                     }
                 }
             });
+            tp(t, r.response, Topic::Recipes);
+            let r = egui::ComboBox::from_id_salt("lesson").selected_text("Lehrbeispiel …").width(170.0).show_ui(ui, |ui| {
+                for r in presets::recipes().iter().filter(|r| r.group == presets::Group::Lesson) {
+                    if ui.selectable_label(false, r.name).on_hover_text(r.info).clicked() {
+                        chosen = Some(r.name);
+                    }
+                }
+            });
+            tp(t, r.response, Topic::Recipes);
         });
-        if let Some(i) = self.preset_info {
-            ui.label(RichText::new(i).small().color(MUTED));
+        if let Some(n) = chosen {
+            self.apply_recipe(n);
+            *t = Topic::Recipes;
         }
-        ui.add_space(4.0);
+    }
+
+    fn cfg_data(&mut self, ui: &mut egui::Ui, t: &mut Topic) {
+        let cur = self.cfg.dataset.clone();
+        let mut pick: Option<DataSpec> = None;
+        ui.horizontal_wrapped(|ui| {
+            for (spec, name) in [(DataSpec::mnist(), "MNIST"), (DataSpec::fashion(), "Fashion-MNIST")] {
+                let r = ui.selectable_label(cur == spec, name);
+                if tp(t, r, Topic::Dataset).clicked() {
+                    pick = Some(spec);
+                }
+            }
+        });
+        tlabel(ui, t, RichText::new("Von Hugging Face:").color(MUTED), Topic::HfImport);
+        ui.horizontal_wrapped(|ui| {
+            for s in HF_SUGGESTIONS.iter() {
+                let spec = DataSpec::hf(s.id, s.side, s.rgb);
+                let r = ui.selectable_label(cur == spec, s.name).on_hover_text(format!("{}\n{}", s.id, s.info));
+                if tp(t, r, Topic::Dataset).clicked() {
+                    pick = Some(spec);
+                }
+            }
+        });
+        egui::CollapsingHeader::new("Eigener Hugging-Face-Datensatz").default_open(matches!(&cur.source, Source::Hf(id) if !HF_SUGGESTIONS.iter().any(|s| s.id == id))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                tlabel(ui, t, "ID:", Topic::HfImport);
+                let r = ui.add(egui::TextEdit::singleline(&mut self.hf_id).hint_text("besitzer/name").desired_width(200.0));
+                tp(t, r, Topic::HfImport);
+            });
+            ui.horizontal(|ui| {
+                tlabel(ui, t, "Größe:", Topic::HfImport);
+                let r = ui.add(egui::DragValue::new(&mut self.hf_side).range(8..=128).suffix(" px"));
+                tp(t, r, Topic::HfImport);
+                let r = ui.checkbox(&mut self.hf_rgb, "Farbe (RGB)");
+                tp(t, r, Topic::HfImport);
+                let r = ui.add_enabled(self.hf_id.contains('/'), egui::Button::new("Laden"));
+                if tp(t, r, Topic::HfImport).clicked() {
+                    pick = Some(DataSpec::hf(&self.hf_id, self.hf_side, self.hf_rgb));
+                }
+            });
+            ui.label(RichText::new("Jeder Datensatz mit einer Image- und einer ClassLabel-Spalte, z. B. von huggingface.co/datasets?task_categories=image-classification").small().color(MUTED));
+        });
+        if let Some(p) = pick {
+            if let Source::Hf(id) = &p.source {
+                self.hf_id = id.clone();
+                self.hf_side = p.side;
+                self.hf_rgb = p.rgb;
+            }
+            self.set_dataset(p);
+        }
+        // Status und Vorschau
+        let ctx = ui.ctx().clone();
+        match self.current_data() {
+            Some(d) => {
+                ui.label(RichText::new(format!("✓ {}: {} Train / {} Test · {} Klassen · {}×{}×{}", d.name, fmt_n(d.n_train()), fmt_n(d.n_test()), d.n_classes(), d.c, d.h, d.w)).color(GREEN).small());
+                let names: Vec<&str> = d.classes.iter().map(|s| s.as_str()).take(26).collect();
+                ui.label(RichText::new(format!("Klassen: {}{}", names.join(", "), if d.n_classes() > 26 { " …" } else { "" })).small().color(MUTED));
+                let n = 16.min(d.n_train());
+                let key = format!("strip_{:?}", d.spec);
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                d.spec.hash(&mut h);
+                let img = self.tex.get(&ctx, "datastrip", h.finish(), || {
+                    let (c, hh, w) = (d.c, d.h, d.w);
+                    let cols = 8;
+                    let rows = n.div_ceil(cols);
+                    let mut px = vec![viz::GAP; (cols * (w + 1) + 1) * (rows * (hh + 1) + 1)];
+                    let iw = cols * (w + 1) + 1;
+                    for k in 0..n {
+                        let s = viz::sample(d.train_image(k * (d.n_train() / n).max(1)), c, hh, w);
+                        let (ox, oy) = (1 + (k % cols) * (w + 1), 1 + (k / cols) * (hh + 1));
+                        for y in 0..hh {
+                            for x in 0..w {
+                                px[(oy + y) * iw + ox + x] = s.pixels[y * w + x];
+                            }
+                        }
+                    }
+                    ColorImage::new([iw, rows * (hh + 1) + 1], px)
+                });
+                let _ = key;
+                let sz = img.size_vec2();
+                let sc = (ui.available_width() / sz.x).min(2.0);
+                image(ui, &img, sz.x * sc, sz.y * sc);
+            }
+            None => {
+                let lm = self.load_msg.lock().unwrap().clone();
+                if lm.starts_with("Fehler") {
+                    ui.label(RichText::new(lm).color(RED).small());
+                    if ui.small_button("Erneut versuchen").clicked() {
+                        self.load_msg.lock().unwrap().clear();
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(if lm.is_empty() { "Lade Datensatz …".to_string() } else { lm }).color(BLUE).small());
+                    });
+                }
+            }
+        }
+        ui.separator();
+        let max_train = self.current_data().map(|d| d.n_train()).unwrap_or(60_000);
+        let c = &mut self.cfg;
+        c.train_size = c.train_size.min(max_train).max(100.min(max_train));
+        ui.horizontal(|ui| {
+            tlabel(ui, t, "Trainingsbeispiele:", Topic::TrainSize);
+            let r = ui.add(egui::DragValue::new(&mut c.train_size).range(100..=max_train).speed(100));
+            tp(t, r, Topic::TrainSize);
+            if ui.small_button("alle").clicked() {
+                c.train_size = max_train;
+                *t = Topic::TrainSize;
+            }
+        });
+        combo(ui, "norm", "Normierung:", &mut c.norm, &Norm::ALL, |n| n.name(), t, Topic::Normalization);
+        ui.horizontal(|ui| {
+            tlabel(ui, t, "Augmentierung:", Topic::Augmentation);
+            let r = ui.add(egui::Slider::new(&mut c.aug.shift, 0..=4).suffix(" px"));
+            tp(t, r, Topic::Augmentation);
+            let r = ui.checkbox(&mut c.aug.flip, "spiegeln");
+            tp(t, r, Topic::Augmentation);
+        });
+        ui.label(RichText::new(format!("Cache: {}", data::cache_dir().display())).small().color(MUTED));
+    }
+
+    fn cfg_arch(&mut self, ui: &mut egui::Ui, t: &mut Topic) {
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            tlabel(ui, t, "Nur Architektur:", Topic::Architecture);
+            let r = egui::ComboBox::from_id_salt("arch").selected_text("Vorlage …").width(200.0).show_ui(ui, |ui| {
+                for p in presets::arch_presets() {
+                    if ui.selectable_label(false, p.name).on_hover_text(p.info).clicked() {
+                        chosen = Some(p.layers.clone());
+                    }
+                }
+            });
+            tp(t, r.response, Topic::Architecture);
+        });
+        if let Some(l) = chosen {
+            self.cfg.layers = l;
+        }
+        ui.add_space(2.0);
         let (shapes, params): (Vec<String>, Vec<usize>) = match &self.preview {
             Ok(m) => m.layers.iter().map(|l| (l.out_shape().describe(), l.n_params())).unzip(),
             Err(_) => (Vec::new(), Vec::new()),
         };
-        ui.label(RichText::new(format!("Eingabe  1×{SIDE}×{SIDE}")).monospace().color(MUTED));
+        let (ic, ih, iw) = self.cfg.dataset.shape();
+        ui.label(RichText::new(format!("Eingabe  {ic}×{ih}×{iw}")).monospace().color(MUTED));
         let mut action: Option<(usize, i32)> = None;
         let n = self.cfg.layers.len();
         for i in 0..n {
@@ -557,35 +762,35 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{:>2}", i + 1)).monospace().color(MUTED));
                     let spec = &mut self.cfg.layers[i];
+                    let topic = layer_topic(spec);
                     match spec {
                         LayerSpec::Dense { units } => {
-                            ui.label(RichText::new("Dense").strong().color(ACCENT));
-                            ui.add(egui::DragValue::new(units).range(1..=4096).speed(2));
+                            tlabel(ui, t, RichText::new("Dense").strong().color(ACCENT), topic);
+                            tp(t, ui.add(egui::DragValue::new(units).range(1..=4096).speed(2)), topic);
                         }
                         LayerSpec::Conv { filters, k, same } => {
-                            ui.label(RichText::new("Conv").strong().color(Color32::from_rgb(230, 90, 160)));
-                            ui.add(egui::DragValue::new(filters).range(1..=128).speed(0.3).suffix(" F"));
-                            ui.add(egui::DragValue::new(k).range(1..=9).speed(0.1).prefix("k="));
-                            ui.checkbox(same, "same");
+                            tlabel(ui, t, RichText::new("Conv").strong().color(Color32::from_rgb(230, 90, 160)), topic);
+                            tp(t, ui.add(egui::DragValue::new(filters).range(1..=256).speed(0.3).suffix(" F")), topic);
+                            tp(t, ui.add(egui::DragValue::new(k).range(1..=9).speed(0.1).prefix("k=")), topic);
+                            tp(t, ui.checkbox(same, "same"), topic);
                         }
                         LayerSpec::MaxPool { size } => {
-                            ui.label(RichText::new("MaxPool").strong().color(Color32::from_rgb(60, 210, 200)));
-                            ui.add(egui::DragValue::new(size).range(2..=4).speed(0.05));
+                            tlabel(ui, t, RichText::new("MaxPool").strong().color(Color32::from_rgb(60, 210, 200)), topic);
+                            tp(t, ui.add(egui::DragValue::new(size).range(2..=4).speed(0.05)), topic);
                         }
                         LayerSpec::Act(a) => {
-                            egui::ComboBox::from_id_salt(("act", i)).selected_text(RichText::new(a.name()).color(GREEN)).width(95.0).show_ui(ui, |ui| {
+                            let r = egui::ComboBox::from_id_salt(("act", i)).selected_text(RichText::new(a.name()).color(GREEN)).width(95.0).show_ui(ui, |ui| {
                                 for k in ActKind::ALL {
                                     ui.selectable_value(a, k, k.name());
                                 }
                             });
+                            tp(t, r.response, topic);
                         }
                         LayerSpec::Dropout { p } => {
-                            ui.label(RichText::new("Dropout").strong());
-                            ui.add(egui::DragValue::new(p).range(0.0..=0.9).speed(0.01).fixed_decimals(2));
+                            tlabel(ui, t, RichText::new("Dropout").strong(), topic);
+                            tp(t, ui.add(egui::DragValue::new(p).range(0.0..=0.9).speed(0.01).fixed_decimals(2)), topic);
                         }
-                        LayerSpec::BatchNorm => {
-                            ui.label(RichText::new("BatchNorm").strong().color(Color32::from_rgb(160, 120, 255)));
-                        }
+                        LayerSpec::BatchNorm => tlabel(ui, t, RichText::new("BatchNorm").strong().color(VIOLET), topic),
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✕").on_hover_text("Entfernen").clicked() {
@@ -613,28 +818,23 @@ impl App {
             None => {}
         }
         if let Some(p) = params.last() {
-            ui.label(RichText::new(format!("Ausgabe  Dense 10 → Softmax ({}, fest)", fmt_n(*p))).monospace().color(MUTED));
+            tlabel(ui, t, RichText::new(format!("Ausgabe  Dense {} → Softmax ({}, fest)", self.n_classes(), fmt_n(*p))).monospace().color(MUTED), Topic::Output);
         }
         ui.horizontal_wrapped(|ui| {
             ui.label("Hinzufügen:");
             let l = &mut self.cfg.layers;
-            if ui.small_button("+ Dense").clicked() {
-                l.push(LayerSpec::Dense { units: 64 });
-            }
-            if ui.small_button("+ Aktivierung").clicked() {
-                l.push(LayerSpec::Act(ActKind::ReLU));
-            }
-            if ui.small_button("+ Conv").clicked() {
-                l.push(LayerSpec::Conv { filters: 8, k: 3, same: true });
-            }
-            if ui.small_button("+ MaxPool").clicked() {
-                l.push(LayerSpec::MaxPool { size: 2 });
-            }
-            if ui.small_button("+ BatchNorm").clicked() {
-                l.push(LayerSpec::BatchNorm);
-            }
-            if ui.small_button("+ Dropout").clicked() {
-                l.push(LayerSpec::Dropout { p: 0.2 });
+            for (name, spec) in [
+                ("+ Dense", LayerSpec::Dense { units: 64 }),
+                ("+ Aktivierung", LayerSpec::Act(ActKind::ReLU)),
+                ("+ Conv", LayerSpec::Conv { filters: 8, k: 3, same: true }),
+                ("+ MaxPool", LayerSpec::MaxPool { size: 2 }),
+                ("+ BatchNorm", LayerSpec::BatchNorm),
+                ("+ Dropout", LayerSpec::Dropout { p: 0.2 }),
+            ] {
+                if ui.small_button(name).clicked() {
+                    *t = layer_topic(&spec);
+                    l.push(spec);
+                }
             }
         });
         match &self.preview {
@@ -648,66 +848,84 @@ impl App {
         }
     }
 
-    fn cfg_init(&mut self, ui: &mut egui::Ui) {
+    fn cfg_init(&mut self, ui: &mut egui::Ui, t: &mut Topic) {
         let c = &mut self.cfg;
-        combo(ui, "init", "Init:", &mut c.init, &Init::ALL, |i| i.name());
-        combo(ui, "loss", "Verlust:", &mut c.loss, &[LossKind::CrossEntropy, LossKind::Mse], |l| l.name());
-        ui.add(egui::Slider::new(&mut c.smoothing, 0.0..=0.3).text("Label Smoothing ε")).on_hover_text("Ziel = (1−ε)·One-Hot + ε/10");
+        combo(ui, "init", "Init:", &mut c.init, &Init::ALL, |i| i.name(), t, Topic::Init);
+        combo(ui, "loss", "Verlust:", &mut c.loss, &[LossKind::CrossEntropy, LossKind::Mse], |l| l.name(), t, Topic::Loss);
+        ui.horizontal(|ui| {
+            tlabel(ui, t, "Label Smoothing ε:", Topic::LabelSmoothing);
+            tp(t, ui.add(egui::Slider::new(&mut c.smoothing, 0.0..=0.3)), Topic::LabelSmoothing);
+        });
     }
 
-    fn cfg_opt(&mut self, ui: &mut egui::Ui) {
+    fn cfg_opt(&mut self, ui: &mut egui::Ui, t: &mut Topic) {
         let c = &mut self.cfg;
-        if combo(ui, "opt", "Verfahren:", &mut c.opt.kind, &OptKind::ALL, |o| o.name()) {
+        let ot = opt_topic(c.opt.kind);
+        if combo(ui, "opt", "Verfahren:", &mut c.opt.kind, &OptKind::ALL, |o| o.name(), t, ot) {
             c.lr = c.opt.kind.default_lr();
+            *t = opt_topic(c.opt.kind);
         }
-        ui.add(egui::Slider::new(&mut c.lr, 1e-5..=1.0).logarithmic(true).text("Lernrate η").custom_formatter(|v, _| format!("{v:.2e}")));
+        let row = |ui: &mut egui::Ui, t: &mut Topic, label: &str, topic: Topic, w: egui::Slider| {
+            ui.horizontal(|ui| {
+                tlabel(ui, t, label, topic);
+                tp(t, ui.add(w), topic);
+            });
+        };
+        row(ui, t, "Lernrate η:", Topic::LearningRate, egui::Slider::new(&mut c.lr, 1e-5..=2.0).logarithmic(true).custom_formatter(|v, _| format!("{v:.2e}")));
         match c.opt.kind {
-            OptKind::Momentum | OptKind::Nesterov => {
-                ui.add(egui::Slider::new(&mut c.opt.momentum, 0.0..=0.99).text("Momentum μ"));
-            }
+            OptKind::Momentum | OptKind::Nesterov => row(ui, t, "Momentum μ:", Topic::Momentum, egui::Slider::new(&mut c.opt.momentum, 0.0..=0.99)),
             OptKind::RmsProp => {
-                ui.add(egui::Slider::new(&mut c.opt.beta2, 0.8..=0.9999).text("ρ (Abklingrate)"));
-                ui.add(egui::Slider::new(&mut c.opt.eps, 1e-10..=1e-3).logarithmic(true).text("ε").custom_formatter(|v, _| format!("{v:.0e}")));
+                row(ui, t, "ρ (Abklingrate):", Topic::RmsProp, egui::Slider::new(&mut c.opt.beta2, 0.8..=0.9999));
+                row(ui, t, "ε:", Topic::Epsilon, egui::Slider::new(&mut c.opt.eps, 1e-10..=1e-3).logarithmic(true).custom_formatter(|v, _| format!("{v:.0e}")));
             }
             OptKind::Adam | OptKind::AdamW => {
-                ui.add(egui::Slider::new(&mut c.opt.beta1, 0.0..=0.99).text("β₁"));
-                ui.add(egui::Slider::new(&mut c.opt.beta2, 0.9..=0.9999).text("β₂"));
-                ui.add(egui::Slider::new(&mut c.opt.eps, 1e-10..=1e-3).logarithmic(true).text("ε").custom_formatter(|v, _| format!("{v:.0e}")));
+                row(ui, t, "β₁:", Topic::Betas, egui::Slider::new(&mut c.opt.beta1, 0.0..=0.99));
+                row(ui, t, "β₂:", Topic::Betas, egui::Slider::new(&mut c.opt.beta2, 0.9..=0.9999));
+                row(ui, t, "ε:", Topic::Epsilon, egui::Slider::new(&mut c.opt.eps, 1e-10..=1e-3).logarithmic(true).custom_formatter(|v, _| format!("{v:.0e}")));
             }
             OptKind::Sgd => {}
         }
-        let wd_label = if c.opt.kind == OptKind::AdamW { "Weight Decay (entkoppelt)" } else { "L2-Regularisierung λ" };
-        ui.add(egui::Slider::new(&mut c.opt.weight_decay, 0.0..=0.1).logarithmic(true).smallest_positive(1e-6).text(wd_label).custom_formatter(|v, _| if v == 0.0 { "0".into() } else { format!("{v:.0e}") }));
+        let wd_label = if c.opt.kind == OptKind::AdamW { "Weight Decay λ:" } else { "L2-Regularisierung λ:" };
+        row(ui, t, wd_label, Topic::WeightDecay, egui::Slider::new(&mut c.opt.weight_decay, 0.0..=0.3).logarithmic(true).smallest_positive(1e-6).custom_formatter(|v, _| if v == 0.0 { "0".into() } else { format!("{v:.0e}") }));
         let mut clip = c.clip.is_some();
         ui.horizontal(|ui| {
-            ui.checkbox(&mut clip, "Gradient Clipping (globale Norm)");
+            tp(t, ui.checkbox(&mut clip, "Gradient Clipping"), Topic::GradClip);
             let mut v = c.clip.unwrap_or(1.0);
-            ui.add_enabled(clip, egui::DragValue::new(&mut v).range(0.01..=100.0).speed(0.05));
+            tp(t, ui.add_enabled(clip, egui::DragValue::new(&mut v).range(0.01..=100.0).speed(0.05).prefix("‖g‖ ≤ ")), Topic::GradClip);
             c.clip = clip.then_some(v);
         });
     }
 
-    fn cfg_sched(&mut self, ui: &mut egui::Ui) {
+    fn cfg_sched(&mut self, ui: &mut egui::Ui, t: &mut Topic) {
         let c = &mut self.cfg;
-        combo(ui, "sched", "Plan:", &mut c.schedule, &Schedule::ALL, |s| s.name());
+        combo(ui, "sched", "Plan:", &mut c.schedule, &Schedule::ALL, |s| s.name(), t, Topic::Schedule);
         match c.schedule {
             Schedule::Constant => {}
             Schedule::Step => {
                 ui.horizontal(|ui| {
-                    ui.label("alle");
-                    ui.add(egui::DragValue::new(&mut c.step_every).range(1..=50));
-                    ui.label("Epochen ×");
-                    ui.add(egui::DragValue::new(&mut c.step_factor).range(0.01..=1.0).speed(0.01));
+                    tlabel(ui, t, "alle", Topic::Schedule);
+                    tp(t, ui.add(egui::DragValue::new(&mut c.step_every).range(1..=50)), Topic::Schedule);
+                    tlabel(ui, t, "Epochen ×", Topic::Schedule);
+                    tp(t, ui.add(egui::DragValue::new(&mut c.step_factor).range(0.01..=1.0).speed(0.01)), Topic::Schedule);
                 });
             }
             Schedule::Exponential => {
-                ui.add(egui::Slider::new(&mut c.exp_gamma, 0.5..=1.0).text("γ pro Epoche"));
+                ui.horizontal(|ui| {
+                    tlabel(ui, t, "γ pro Epoche:", Topic::Schedule);
+                    tp(t, ui.add(egui::Slider::new(&mut c.exp_gamma, 0.5..=1.0)), Topic::Schedule);
+                });
             }
             Schedule::Cosine => {
-                ui.add(egui::Slider::new(&mut c.lr_min_frac, 0.0..=0.5).text("Minimum (Anteil)"));
+                ui.horizontal(|ui| {
+                    tlabel(ui, t, "Minimum (Anteil):", Topic::Schedule);
+                    tp(t, ui.add(egui::Slider::new(&mut c.lr_min_frac, 0.0..=0.5)), Topic::Schedule);
+                });
             }
         }
-        ui.add(egui::Slider::new(&mut c.warmup_epochs, 0.0..=5.0).text("Warmup (Epochen)"));
+        ui.horizontal(|ui| {
+            tlabel(ui, t, "Warmup:", Topic::Warmup);
+            tp(t, ui.add(egui::Slider::new(&mut c.warmup_epochs, 0.0..=5.0).suffix(" Ep.")), Topic::Warmup);
+        });
         let pts: Vec<[f64; 2]> = (0..=200)
             .map(|i| {
                 let e = i as f32 / 200.0 * c.epochs as f32;
@@ -715,33 +933,105 @@ impl App {
             })
             .collect();
         let mx = pts.iter().map(|p| p[1]).fold(0.0, f64::max);
-        Plot::new("lrplan").height(90.0).allow_drag(false).allow_zoom(false).allow_scroll(false).include_y(0.0).include_y(mx * 1.15).x_axis_label("Epoche").show(ui, |p| {
+        let r = Plot::new("lrplan").height(90.0).allow_drag(false).allow_zoom(false).allow_scroll(false).include_y(0.0).include_y(mx * 1.15).x_axis_label("Epoche").show(ui, |p| {
             p.line(Line::new("η", PlotPoints::from(pts)).color(ACCENT));
         });
+        tp(t, r.response, Topic::Schedule);
     }
 
-    fn cfg_train(&mut self, ui: &mut egui::Ui) {
+    fn cfg_train(&mut self, ui: &mut egui::Ui, t: &mut Topic) {
         let cores = self.cores;
         let c = &mut self.cfg;
-        ui.add(egui::Slider::new(&mut c.epochs, 1..=100).text("Epochen"));
-        ui.add(egui::Slider::new(&mut c.batch, 1..=1024).logarithmic(true).text("Batchgröße"));
+        let row = |ui: &mut egui::Ui, t: &mut Topic, label: &str, topic: Topic, w: egui::Slider| {
+            ui.horizontal(|ui| {
+                tlabel(ui, t, label, topic);
+                tp(t, ui.add(w), topic);
+            });
+        };
+        row(ui, t, "Epochen:", Topic::Epochs, egui::Slider::new(&mut c.epochs, 1..=100));
+        row(ui, t, "Batchgröße:", Topic::BatchSize, egui::Slider::new(&mut c.batch, 1..=1024).logarithmic(true));
         c.threads = c.threads.clamp(1, cores);
-        ui.add(egui::Slider::new(&mut c.threads, 1..=cores).text(format!("CPU-Threads (von {cores})")))
-            .on_hover_text("So viele Kerne rechnen parallel. In der Aktivitätsanzeige siehst du die Last, oben Durchsatz und GFLOP/s.");
+        row(ui, t, &format!("CPU-Threads (von {cores}):"), Topic::Threads, egui::Slider::new(&mut c.threads, 1..=cores));
         ui.horizontal(|ui| {
-            ui.label("Seed:");
-            ui.add(egui::DragValue::new(&mut c.seed));
+            tlabel(ui, t, "Seed:", Topic::Seed);
+            tp(t, ui.add(egui::DragValue::new(&mut c.seed)), Topic::Seed);
             if ui.small_button("🎲").clicked() {
                 c.seed = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1) % 1_000_000) as u64;
+                *t = Topic::Seed;
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Test-Stichprobe alle");
-            ui.add(egui::DragValue::new(&mut c.eval_every).range(0..=2000).speed(5));
-            ui.label("Schritte");
-        })
-        .response
-        .on_hover_text("Zwischenauswertung auf 1000 Testbildern; am Epochenende immer auf allen 10 000. 0 = aus.");
+            tlabel(ui, t, "Test-Stichprobe alle", Topic::EvalEvery);
+            tp(t, ui.add(egui::DragValue::new(&mut c.eval_every).range(0..=2000).speed(5)), Topic::EvalEvery);
+            tlabel(ui, t, "Schritte", Topic::EvalEvery);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tutorial-Leiste
+// ---------------------------------------------------------------------------
+
+impl App {
+    fn tutorial_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("🎓 Tutorial").size(17.0).strong().color(ACCENT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("Tutorial ausblenden").clicked() {
+                    self.show_tutorial = false;
+                }
+            });
+        });
+        ui.label(RichText::new("Klicke auf einen Parameter, einen Tab oder ein Diagramm.").small().color(MUTED));
+        ui.separator();
+        let d = tutorial::doc(self.topic);
+        ui.label(RichText::new(d.title).size(19.0).strong());
+        ui.add_space(4.0);
+        if let Some(c) = tutorial::current(self.topic, &self.cfg, self.cores) {
+            egui::Frame::new().fill(Color32::from_rgb(40, 34, 24)).corner_radius(4.0).inner_margin(6.0).show(ui, |ui| {
+                ui.label(RichText::new(c).color(ACCENT));
+            });
+            ui.add_space(4.0);
+        }
+        ui.label(RichText::new(d.what).size(14.0));
+        if !d.math.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Mathematik").strong().color(BLUE));
+            egui::Frame::new().fill(Color32::from_gray(22)).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
+                ui.label(RichText::new(d.math).monospace().size(13.0));
+            });
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Übliche Werte").strong().color(GREEN));
+        ui.label(d.typical);
+        ui.add_space(6.0);
+        ui.label(RichText::new("Beobachten & ausprobieren").strong().color(VIOLET));
+        ui.label(d.watch);
+        if !d.related.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Siehe auch:").color(MUTED));
+                for &r in d.related {
+                    if ui.link(tutorial::doc(r).title).clicked() {
+                        self.topic = r;
+                    }
+                }
+            });
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        egui::CollapsingHeader::new(RichText::new("Alle Themen").strong()).default_open(false).show(ui, |ui| {
+            for (group, topics) in tutorial::index() {
+                ui.label(RichText::new(group).color(MUTED).small());
+                ui.horizontal_wrapped(|ui| {
+                    for tt in topics {
+                        if ui.selectable_label(self.topic == tt, tutorial::doc(tt).title).clicked() {
+                            self.topic = tt;
+                        }
+                    }
+                });
+            }
+        });
     }
 }
 
@@ -762,13 +1052,13 @@ fn line(name: impl Into<String>, pts: Vec<[f64; 2]>, color: Color32) -> Series {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn chart(ui: &mut egui::Ui, id: &str, title: &str, height: f32, log: bool, series: Vec<Series>, hline: Option<(f64, &str)>, x_label: &str) {
-    ui.label(RichText::new(title).strong());
+fn chart(ui: &mut egui::Ui, slot: &mut Topic, topic: Topic, id: &str, title: &str, height: f32, log: bool, series: Vec<Series>, hline: Option<(f64, &str)>, x_label: &str) {
+    tlabel(ui, slot, RichText::new(title).strong(), topic);
     let mut p = Plot::new(id).height(height.max(80.0)).legend(Legend::default()).x_axis_label(x_label).allow_scroll(false);
     if log {
         p = p.y_axis_formatter(|m, _| viz::log_label(m.value));
     }
-    p.show(ui, |pu| {
+    let r = p.show(ui, |pu| {
         for se in series {
             if se.pts.is_empty() {
                 continue;
@@ -782,13 +1072,27 @@ fn chart(ui: &mut egui::Ui, id: &str, title: &str, height: f32, log: bool, serie
             pu.hline(HLine::new(name, y).color(MUTED));
         }
     });
+    tp(slot, r.response, topic);
 }
 
-fn bar_probs(ui: &mut egui::Ui, probs: &[f32], names: &[&str; 10], truth: Option<usize>, width: f32) {
-    let pred = (0..probs.len()).max_by(|&a, &b| probs[a].total_cmp(&probs[b])).unwrap_or(0);
-    for (i, &p) in probs.iter().enumerate() {
+fn argmax(v: &[f32]) -> usize {
+    (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap_or(0)
+}
+
+/// Wahrscheinlichkeitsbalken; bei vielen Klassen nur die zehn wahrscheinlichsten.
+fn bar_probs(ui: &mut egui::Ui, probs: &[f32], names: &[String], truth: Option<usize>, width: f32) {
+    let pred = argmax(probs);
+    let mut order: Vec<usize> = (0..probs.len()).collect();
+    if probs.len() > 12 {
+        order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+        order.truncate(10);
+        ui.label(RichText::new(format!("die 10 wahrscheinlichsten von {} Klassen", probs.len())).small().color(MUTED));
+    }
+    for i in order {
+        let p = probs[i];
         ui.horizontal(|ui| {
-            let mut name = RichText::new(format!("{:>8}", names[i])).monospace();
+            let short: String = names.get(i).map(|s| s.chars().take(14).collect()).unwrap_or_default();
+            let mut name = RichText::new(format!("{short:>14}")).monospace();
             if Some(i) == truth {
                 name = name.color(GREEN).strong();
             }
@@ -829,6 +1133,10 @@ fn stats(v: &[f32]) -> String {
     format!("n={}  μ={mean:+.2e}  σ={sd:.2e}  min={mn:+.2e}  max={mx:+.2e}  ‖·‖₂={norm:.3e}", v.len())
 }
 
+fn short(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tab: Verlauf
 // ---------------------------------------------------------------------------
@@ -860,15 +1168,18 @@ impl App {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("Noch kein Training gelaufen.").size(18.0));
-                ui.label("Links Architektur und Parameter wählen, dann oben „Training starten“.");
+                ui.label("Links eine Voreinstellung oder eigene Parameter wählen, dann oben „Training starten“.");
                 ui.label(RichText::new("Tipp: Der Tab „Netz & Aktivierungen“ zeigt das untrainierte Netz schon jetzt.").color(MUTED));
             });
             return;
         }
-        let h = (ui.available_height() - 70.0) / 2.0 - 24.0;
+        let h = (ui.available_height() - 70.0) / 2.0 - 26.0;
+        let topic = &mut self.topic;
         ui.columns(2, |c| {
             chart(
                 &mut c[0],
+                topic,
+                Topic::ViewLoss,
                 "loss",
                 if lg { "Verlust (log)" } else { "Verlust" },
                 h,
@@ -881,29 +1192,18 @@ impl App {
                 None,
                 "Schritt",
             );
-            chart(
-                &mut c[1],
-                "acc",
-                "Genauigkeit [%]",
-                h,
-                false,
-                vec![line("Train-Batches (geglättet)", acc_s, ACCENT), Series { name: "Test".into(), pts: val_acc, color: BLUE, width: 2.0, dots: true }],
-                None,
-                "Schritt",
-            );
+            chart(&mut c[1], topic, Topic::ViewAcc, "acc", "Genauigkeit [%]", h, false, vec![line("Train-Batches (geglättet)", acc_s, ACCENT), Series { name: "Test".into(), pts: val_acc, color: BLUE, width: 2.0, dots: true }], None, "Schritt");
         });
         ui.columns(3, |c| {
             let lr_max = lr.iter().map(|p| p[1]).fold(0.0, f64::max);
-            c[0].label(RichText::new("Lernrate η").strong());
-            Plot::new("lr").height(h.max(80.0)).include_y(0.0).include_y(lr_max * 1.15).x_axis_label("Schritt").allow_scroll(false).show(&mut c[0], |p| {
+            tlabel(&mut c[0], topic, RichText::new("Lernrate η").strong(), Topic::Schedule);
+            let r = Plot::new("lr").height(h.max(80.0)).include_y(0.0).include_y(lr_max * 1.15).x_axis_label("Schritt").allow_scroll(false).show(&mut c[0], |p| {
                 p.line(Line::new("η", PlotPoints::from(lr)).color(GREEN).width(1.6));
             });
-            chart(&mut c[1], "gn", "Globale Gradientennorm ‖∇θ‖ (log)", h, true, vec![line("‖∇θ‖", gn, Color32::from_rgb(230, 90, 160))], None, "Schritt");
-            let se = vec![
-                Series { name: "Train-Acc".into(), pts: ep_tr, color: ACCENT, width: 2.0, dots: true },
-                Series { name: "Test-Acc".into(), pts: ep_te, color: BLUE, width: 2.0, dots: true },
-            ];
-            chart(&mut c[2], "ep", "Pro Epoche: Train vs. Test [%]", h, false, se, None, "Epoche");
+            tp(topic, r.response, Topic::Schedule);
+            chart(&mut c[1], topic, Topic::GradClip, "gn", "Globale Gradientennorm ‖∇θ‖ (log)", h, true, vec![line("‖∇θ‖", gn, Color32::from_rgb(230, 90, 160))], None, "Schritt");
+            let se = vec![Series { name: "Train-Acc".into(), pts: ep_tr, color: ACCENT, width: 2.0, dots: true }, Series { name: "Test-Acc".into(), pts: ep_te, color: BLUE, width: 2.0, dots: true }];
+            chart(&mut c[2], topic, Topic::ViewAcc, "ep", "Pro Epoche: Train vs. Test [%]", h, false, se, None, "Epoche");
         });
     }
 }
@@ -914,14 +1214,13 @@ impl App {
 
 impl App {
     fn probe_selector(&mut self, ui: &mut egui::Ui) {
-        let ds = self.dataset();
+        let n = self.dataset().map(|d| d.n_test()).unwrap_or(10_000).max(1);
         let wrong: Vec<usize> = self.tr.shared.lock().unwrap().last_eval.as_ref().map(|e| e.wrong.iter().map(|w| w.0).collect()).unwrap_or_default();
         ui.horizontal_wrapped(|ui| {
             let mut idx = match self.probe {
-                Probe::Test(i) => i,
+                Probe::Test(i) => i.min(n - 1),
                 Probe::Drawing => 0,
             };
-            let n = ds.as_ref().map(|d| d.n_test()).unwrap_or(10_000);
             ui.label("Testbild");
             if ui.small_button("◀").clicked() {
                 self.probe = Probe::Test((idx + n - 1) % n);
@@ -948,18 +1247,19 @@ impl App {
 
     fn tab_netz(&mut self, ui: &mut egui::Ui) {
         self.probe_selector(ui);
-        let ds = self.dataset();
         let ctx = ui.ctx().clone();
         let probe = self.probe;
-        let Some((tr, model, cfg, trained)) = self.trace() else {
-            ui.label(self.load_msg.lock().unwrap().clone());
-            ui.label("Datensatz wird geladen …");
-            return;
+        let (key, img, probs, outs, input, model, cfg, trained, ds) = match self.trace() {
+            Ok((tr, model, cfg, trained, ds)) => (tr.key, tr.img.clone(), tr.probs.clone(), tr.outs.clone(), tr.input.clone(), model, cfg, trained, ds),
+            Err(e) => {
+                ui.add_space(30.0);
+                ui.label(RichText::new(e).size(16.0));
+                return;
+            }
         };
-        let (key, img, probs, outs, input) = (tr.key, tr.img.clone(), tr.probs.clone(), tr.outs.clone(), tr.input.clone());
-        let names = cfg.dataset.class_names();
-        let truth = match (probe, &ds) {
-            (Probe::Test(i), Some(d)) => Some(d.test_y[i.min(d.n_test() - 1)] as usize),
+        let names = &ds.classes;
+        let truth = match probe {
+            Probe::Test(i) => Some(ds.test_y[i.min(ds.n_test() - 1)] as usize),
             _ => None,
         };
         if !trained {
@@ -967,67 +1267,86 @@ impl App {
         }
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(300.0);
+                ui.set_width(310.0);
                 ui.label(RichText::new("Eingabe").strong());
-                let t = self.tex.get(&ctx, "probe_img", key, || viz::digit(&img, SIDE));
-                image(ui, &t, 196.0, 196.0);
-                let ti = self.tex.get(&ctx, "probe_in", key, || viz::vector(&input, SIDE, viz::Scale::auto(&input)));
+                let side = 196.0;
+                let t = self.tex.get(&ctx, "probe_img", key, || if probe == Probe::Drawing { viz::sample(&img, 1, 28, 28) } else { viz::sample(&img, ds.c, ds.h, ds.w) });
+                image(ui, &t, side, side * ds.h as f32 / ds.w as f32);
+                let ti = self.tex.get(&ctx, "probe_in", key, || act_image(&input, model.input));
                 ui.horizontal(|ui| {
-                    image(ui, &ti, 84.0, 84.0);
+                    let sz = ti.size_vec2();
+                    let s = 84.0 / sz.y;
+                    image(ui, &ti, sz.x * s, 84.0);
                     let mn = input.iter().cloned().fold(f32::INFINITY, f32::min);
                     let mx = input.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    ui.label(RichText::new(format!("ins Netz (normiert)\n{}\nmin {mn:+.2}\nmax {mx:+.2}", cfg.norm.name())).small().color(MUTED));
+                    tlabel(ui, &mut self.topic, RichText::new(format!("ins Netz (normiert)\n{}\nmin {mn:+.2}\nmax {mx:+.2}", cfg.norm.name())).small().color(MUTED), Topic::Normalization);
                 });
                 if let Some(t) = truth {
                     ui.label(format!("Wahres Label: {}", names[t]));
                 }
-                let pred = (0..10).max_by(|&a, &b| probs[a].total_cmp(&probs[b])).unwrap_or(0);
-                ui.label(RichText::new(format!("Vorhersage: {}  ({:.1} %)", names[pred], probs[pred] * 100.0)).size(17.0).strong().color(if truth.is_none_or(|t| t == pred) { GREEN } else { RED }));
+                let pred = argmax(&probs);
+                ui.label(RichText::new(format!("Vorhersage: {}  ({:.1} %)", names.get(pred).map(|s| s.as_str()).unwrap_or("?"), probs[pred] * 100.0)).size(17.0).strong().color(if truth.is_none_or(|t| t == pred) { GREEN } else { RED }));
                 ui.add_space(6.0);
-                ui.label(RichText::new("Softmax-Ausgabe").strong());
-                bar_probs(ui, &probs, &names, truth, 120.0);
+                tlabel(ui, &mut self.topic, RichText::new("Softmax-Ausgabe").strong(), Topic::Output);
+                bar_probs(ui, &probs, names, truth, 110.0);
             });
             ui.separator();
-            egui::ScrollArea::vertical().id_salt("layers").auto_shrink(false).show(ui, |ui| ui.vertical(|ui| {
-                let avail = (ui.available_width() - 270.0).max(200.0);
-                let mut shape = model.input;
-                let nl = model.layers.len();
-                for (li, (l, out)) in model.layers.iter().zip(&outs).enumerate() {
-                    let os = l.out_shape();
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(240.0);
-                                let title = if li + 1 == nl { "Ausgabe (Logits)".to_string() } else { l.name() };
-                                ui.label(RichText::new(format!("{}  {title}", li + 1)).strong().color(layer_color(l)));
-                                ui.label(RichText::new(format!("{} → {}", shape.describe(), os.describe())).monospace().small());
-                                if l.n_params() > 0 {
-                                    ui.label(RichText::new(format!("{} Parameter, {} MACs", fmt_n(l.n_params()), fmt_n(l.macs()))).small().color(MUTED));
-                                }
-                                let n = out.len().max(1) as f32;
-                                let mean = out.iter().sum::<f32>() / n;
-                                let sd = (out.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n).sqrt();
-                                let mut info = format!("μ={mean:+.3}  σ={sd:.3}");
-                                if let Layer::Act(a) = l {
-                                    if matches!(a.kind, ActKind::ReLU) {
-                                        let zero = out.iter().filter(|&&v| v <= 0.0).count();
-                                        info += &format!("\n{:.0} % der Einheiten = 0", zero as f32 / n * 100.0);
+            egui::ScrollArea::vertical().id_salt("layers").auto_shrink(false).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    let avail = (ui.available_width() - 270.0).max(200.0);
+                    let mut shape = model.input;
+                    let nl = model.layers.len();
+                    for (li, (l, out)) in model.layers.iter().zip(&outs).enumerate() {
+                        let os = l.out_shape();
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(240.0);
+                                    let title = if li + 1 == nl { "Ausgabe (Logits)".to_string() } else { l.name() };
+                                    tlabel(ui, &mut self.topic, RichText::new(format!("{}  {title}", li + 1)).strong().color(layer_color(l)), layer_topic_of(l, li + 1 == nl));
+                                    ui.label(RichText::new(format!("{} → {}", shape.describe(), os.describe())).monospace().small());
+                                    if l.n_params() > 0 {
+                                        ui.label(RichText::new(format!("{} Parameter, {} MACs", fmt_n(l.n_params()), fmt_n(l.macs()))).small().color(MUTED));
                                     }
-                                }
-                                ui.label(RichText::new(info).small().monospace().color(MUTED));
+                                    let n = out.len().max(1) as f32;
+                                    let mean = out.iter().sum::<f32>() / n;
+                                    let sd = (out.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n).sqrt();
+                                    let mut info = format!("μ={mean:+.3}  σ={sd:.3}");
+                                    if let Layer::Act(a) = l {
+                                        if a.kind == ActKind::ReLU {
+                                            let zero = out.iter().filter(|&&v| v <= 0.0).count();
+                                            info += &format!("\n{:.0} % der Einheiten = 0", zero as f32 / n * 100.0);
+                                        }
+                                    }
+                                    ui.label(RichText::new(info).small().monospace().color(MUTED));
+                                });
+                                let img = act_image(out, os);
+                                let (iw, ih) = (img.size[0] as f32, img.size[1] as f32);
+                                let sc = (avail / iw).min(if os.spatial() { 4.0 } else { 14.0 }).min(340.0 / ih).max(0.5);
+                                let t = self.tex.get(&ctx, &format!("act{li}"), key, || img);
+                                image(ui, &t, iw * sc, ih * sc);
                             });
-                            let img = act_image(out, os);
-                            let (iw, ih) = (img.size[0] as f32, img.size[1] as f32);
-                            let sc = (avail / iw).min(if os.spatial() { 4.0 } else { 14.0 }).min(340.0 / ih).max(0.5);
-                            let t = self.tex.get(&ctx, &format!("act{li}"), key, || img);
-                            image(ui, &t, iw * sc, ih * sc);
                         });
-                    });
-                    shape = os;
-                }
-                ui.label(RichText::new("Farben: orange = positiv, blau = negativ (falls negative Werte vorkommen), sonst Viridis von 0 bis Maximum. Jede Schicht ist für sich normiert.").small().color(MUTED));
-            }));
+                        shape = os;
+                    }
+                    ui.label(RichText::new("Farben: orange = positiv, blau = negativ (falls negative Werte vorkommen), sonst Viridis von 0 bis Maximum. Jede Schicht ist für sich normiert.").small().color(MUTED));
+                });
+            });
         });
+    }
+}
+
+fn layer_topic_of(l: &Layer, last: bool) -> Topic {
+    if last {
+        return Topic::Output;
+    }
+    match l {
+        Layer::Dense(_) => Topic::Dense,
+        Layer::Conv(_) => Topic::Conv,
+        Layer::Pool(_) => Topic::MaxPool,
+        Layer::Act(_) => Topic::Activation,
+        Layer::Dropout(_) => Topic::Dropout,
+        Layer::BatchNorm(_) => Topic::BatchNorm,
     }
 }
 
@@ -1038,12 +1357,12 @@ fn layer_color(l: &Layer) -> Color32 {
         Layer::Pool(_) => Color32::from_rgb(60, 210, 200),
         Layer::Act(_) => GREEN,
         Layer::Dropout(_) => MUTED,
-        Layer::BatchNorm(_) => Color32::from_rgb(160, 120, 255),
+        Layer::BatchNorm(_) => VIOLET,
     }
 }
 
-/// Aktivierungsbild: räumlich = eine Kachel pro Kanal, sonst ein Pixelraster.
-fn act_image(out: &[f32], s: nn::Shape) -> ColorImage {
+/// Aktivierungsbild: räumlich = eine Kachel pro Kanal, sonst Pixelraster.
+fn act_image(out: &[f32], s: Shape) -> ColorImage {
     let sc = viz::Scale::auto(out);
     if s.spatial() {
         viz::tiles(s.c, s.w, s.h, s.c.min(16), |_| sc, |t, x, y| out[t * s.h * s.w + y * s.w + x])
@@ -1061,6 +1380,7 @@ fn max_abs(v: &[f32]) -> f32 {
     v.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-8)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_img(ui: &mut egui::Ui, tex: &mut Textures, ctx: &egui::Context, key: &str, ver: u64, img: ColorImage, max_w: f32, max_scale: f32) {
     let (w, h) = (img.size[0] as f32, img.size[1] as f32);
     let s = (max_w / w).min(max_scale).max(0.25);
@@ -1090,6 +1410,8 @@ impl App {
             ui.label(RichText::new("Untrainierte Startgewichte. Vergleiche die Initialisierungen He, Xavier, σ=0,01 und Null.").color(ACCENT));
         }
         let li = self.sel_layer;
+        let first_param = pl.first() == Some(&li);
+        let inp = model.input;
         let layer = &model.layers[li];
         let ps = layer.params();
         let (w, g) = (&ps[0].w, &ps[0].g);
@@ -1097,11 +1419,18 @@ impl App {
         let top_h = (ui.available_height() * 0.58).max(200.0);
         let v = ver.wrapping_mul(131) ^ li as u64;
         egui::ScrollArea::vertical().id_salt("wts").max_height(top_h).auto_shrink([false, true]).show(ui, |ui| match layer {
-            Layer::Dense(d) if d.inp == PIX => {
-                ui.label(RichText::new(format!("Eingehende Gewichte jedes der {} Neuronen als 28×28-Bild: das Muster, auf das ein Neuron anspricht.", d.out)).color(MUTED));
+            Layer::Dense(d) if first_param && d.inp == inp.len() && inp.spatial() => {
+                let (h, ww, c) = (inp.h, inp.w, inp.c);
+                ui.label(RichText::new(format!("Eingehende Gewichte jedes der {} Neuronen als {h}×{ww}-Bild: das Muster, auf das ein Neuron anspricht{}.", d.out, if c == 3 { " (Farbe = Gewicht pro Kanal, Grau = 0)" } else { "" })).color(MUTED));
                 let n = d.out.min(256);
                 let cols = if n <= 10 { n } else { ((avail / 64.0) as usize).clamp(4, 32) };
-                let img = viz::tiles(n, SIDE, SIDE, cols, |t| viz::Scale::Signed(max_abs(&w[t * PIX..][..PIX])), |t, x, y| w[t * PIX + y * SIDE + x]);
+                let il = d.inp;
+                let hw = h * ww;
+                let img = if c == 3 {
+                    viz::rgb_tiles(n, ww, h, cols, |t| max_abs(&w[t * il..][..il]), |t, ch, x, y| w[t * il + ch * hw + y * ww + x])
+                } else {
+                    viz::tiles(n, ww, h, cols, |t| viz::Scale::Signed(max_abs(&w[t * il..][..il])), |t, x, y| w[t * il + y * ww + x])
+                };
                 show_img(ui, &mut self.tex, &ctx, "w_dense", v, img, avail, 6.0);
                 if d.out > 256 {
                     ui.label(RichText::new("(die ersten 256 Neuronen)").small().color(MUTED));
@@ -1116,12 +1445,17 @@ impl App {
                 let t = self.tex.get(&ctx, "w_mat", v, || img);
                 image(ui, &t, d.inp as f32 * s, h);
             }
+            Layer::Conv(c) if c.cin == 3 => {
+                ui.label(RichText::new(format!("{} Farbfilter à {}×{}: Farbe = Gewicht pro Kanal (R, G, B), Grau = 0.", c.cout, c.k, c.k)).color(MUTED));
+                let (kk, ckk) = (c.k * c.k, 3 * c.k * c.k);
+                let img = viz::rgb_tiles(c.cout, c.k, c.k, c.cout.min(16), |t| max_abs(&w[t * ckk..][..ckk]), |t, ch, x, y| w[t * ckk + ch * kk + y * c.k + x]);
+                show_img(ui, &mut self.tex, &ctx, "w_conv", v, img, avail.min(16.0 * 110.0), 24.0);
+            }
             Layer::Conv(c) => {
                 let cin = c.cin.min(16);
                 ui.label(RichText::new(format!("{} Filter mit je {}×{}×{} Gewichten. Zeile = Ausgabekanal, Spalte = Eingangskanal{}.", c.cout, c.cin, c.k, c.k, if c.cin > 16 { " (erste 16)" } else { "" })).color(MUTED));
                 let kk = c.k * c.k;
                 let ckk = c.cin * kk;
-                // Bei nur einem Eingangskanal: Filter nebeneinander statt untereinander
                 let cols = if cin == 1 { c.cout.min(16) } else { cin };
                 let img = viz::tiles(c.cout * cin, c.k, c.k, cols, |t| viz::Scale::Signed(max_abs(&w[(t / cin) * ckk..][..ckk])), |t, x, y| w[(t / cin) * ckk + (t % cin) * kk + y * c.k + x]);
                 show_img(ui, &mut self.tex, &ctx, "w_conv", v, img, avail.min(cols as f32 * 110.0), 24.0);
@@ -1141,17 +1475,20 @@ impl App {
         let hw = histogram(w, 60);
         let hg = histogram(g, 60);
         let h = (ui.available_height() - 50.0).max(110.0);
+        let topic = &mut self.topic;
         ui.columns(2, |c| {
-            c[0].label(RichText::new("Histogramm der Gewichte").strong());
+            tlabel(&mut c[0], topic, RichText::new("Histogramm der Gewichte").strong(), Topic::ViewHistogram);
             c[0].label(RichText::new(stats(w)).small().monospace().color(MUTED));
-            Plot::new("hw").height(h).show(&mut c[0], |p| p.bar_chart(BarChart::new("W", hw).color(ACCENT)));
-            c[1].label(RichText::new("Histogramm des letzten Gradienten ∂L/∂W").strong());
+            let r = Plot::new("hw").height(h).show(&mut c[0], |p| p.bar_chart(BarChart::new("W", hw).color(ACCENT)));
+            tp(topic, r.response, Topic::ViewHistogram);
+            tlabel(&mut c[1], topic, RichText::new("Histogramm des letzten Gradienten ∂L/∂W").strong(), Topic::ViewHistogram);
             c[1].label(RichText::new(stats(g)).small().monospace().color(MUTED));
             if g.iter().all(|&x| x == 0.0) {
                 c[1].add_space(30.0);
                 c[1].label(RichText::new("Noch kein Gradient: Er entsteht beim ersten Trainingsschritt (z. B. mit „Schrittweise“ und ⏭ 1).").color(MUTED));
             } else {
-                Plot::new("hg").height(h).show(&mut c[1], |p| p.bar_chart(BarChart::new("∂L/∂W", hg).color(BLUE)));
+                let r = Plot::new("hg").height(h).show(&mut c[1], |p| p.bar_chart(BarChart::new("∂L/∂W", hg).color(BLUE)));
+                tp(topic, r.response, Topic::ViewHistogram);
             }
         });
     }
@@ -1195,18 +1532,19 @@ impl App {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("Hier erscheinen nach dem Start die Gradienten pro Schicht.").size(18.0));
-                ui.label("Gut zu beobachten mit der Vorlage „Tiefes Sigmoid-MLP“: Die Gradienten der vorderen Schichten sind um Größenordnungen kleiner.");
+                ui.label("Gut zu beobachten mit dem Lehrbeispiel „Vanishing Gradients“: Die Gradienten der vorderen Schichten sind um Größenordnungen kleiner.");
             });
             return;
         }
-        let h = (ui.available_height() - 80.0) / 2.0 - 24.0;
+        let h = (ui.available_height() - 80.0) / 2.0 - 26.0;
+        let topic = &mut self.topic;
         ui.columns(2, |c| {
-            chart(&mut c[0], "gnl", "‖∂L/∂W‖ pro Schicht (log)", h, true, gn, None, "Schritt");
-            chart(&mut c[1], "url", "Update-Verhältnis ‖ΔW‖ / ‖W‖ pro Schritt (log)", h, true, ur, Some((-3.0, "Faustregel ≈ 1e-3")), "Schritt");
+            chart(&mut c[0], topic, Topic::ViewGradNorm, "gnl", "‖∂L/∂W‖ pro Schicht (log)", h, true, gn, None, "Schritt");
+            chart(&mut c[1], topic, Topic::ViewUpdateRatio, "url", "Update-Verhältnis ‖ΔW‖ / ‖W‖ pro Schritt (log)", h, true, ur, Some((-3.0, "Faustregel ≈ 1e-3")), "Schritt");
         });
         ui.columns(2, |c| {
-            chart(&mut c[0], "astd", "Standardabweichung der Aktivierungen (Trainingsbatch)", h, false, astd, None, "Schritt");
-            chart(&mut c[1], "dead", "Inaktive (ReLU ≤ 0) bzw. gesättigte (Sigmoid, Tanh) Einheiten [%]", h, false, dead, None, "Schritt");
+            chart(&mut c[0], topic, Topic::ViewActStats, "astd", "Standardabweichung der Aktivierungen (Trainingsbatch)", h, false, astd, None, "Schritt");
+            chart(&mut c[1], topic, Topic::ViewActStats, "dead", "Inaktive (ReLU ≤ 0) bzw. gesättigte (Sigmoid, Tanh) Einheiten [%]", h, false, dead, None, "Schritt");
         });
     }
 }
@@ -1217,36 +1555,44 @@ impl App {
 
 impl App {
     fn tab_auswertung(&mut self, ui: &mut egui::Ui) {
-        let (ev, kind) = {
+        let (ev, spec) = {
             let s = self.tr.shared.lock().unwrap();
-            (s.last_eval.clone(), s.cfg.dataset)
+            (s.last_eval.clone(), s.cfg.dataset.clone())
         };
         let Some(ev) = ev else {
             ui.add_space(40.0);
-            ui.vertical_centered(|ui| ui.label(RichText::new("Die Auswertung auf allen 10 000 Testbildern erscheint nach der ersten Epoche.").size(18.0)));
+            ui.vertical_centered(|ui| ui.label(RichText::new("Die Auswertung auf dem ganzen Testset erscheint nach der ersten Epoche.").size(18.0)));
             return;
         };
-        let names = kind.class_names();
-        let ds = self.dataset();
+        let Some(ds) = self.dataset().filter(|d| d.spec == spec) else {
+            ui.label(format!("Die Auswertung gehört zu „{}“, das gerade nicht geladen ist.", spec.label()));
+            return;
+        };
+        let names = &ds.classes;
+        let k = ev.confusion.len();
         let ctx = ui.ctx().clone();
         let errors: u32 = ev.confusion.iter().enumerate().map(|(i, r)| r.iter().sum::<u32>() - r[i]).sum();
         ui.label(RichText::new(format!("Testset: Genauigkeit {:.2} %  ·  Verlust {:.4}  ·  {errors} Fehler", ev.acc * 100.0, ev.loss)).size(16.0).strong());
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("Konfusionsmatrix (Zeile = wahr, Spalte = vorhergesagt)").strong());
-                let cell = 42.0;
-                let lab = 66.0;
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(lab + cell * 10.0 + 70.0, 24.0 + cell * 10.0 + 4.0), Sense::hover());
+                tlabel(ui, &mut self.topic, RichText::new("Konfusionsmatrix (Zeile = wahr, Spalte = vorhergesagt)").strong(), Topic::ViewConfusion);
+                let cell = (440.0 / k as f32).clamp(14.0, 42.0);
+                let lab = 80.0;
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(lab + cell * k as f32 + 70.0, 24.0 + cell * k as f32 + 4.0), Sense::click());
+                tp(&mut self.topic, resp, Topic::ViewConfusion);
                 let p = ui.painter_at(rect);
                 let o = rect.min + egui::vec2(lab, 24.0);
                 let maxoff = ev.confusion.iter().enumerate().flat_map(|(i, r)| r.iter().enumerate().filter(move |(j, _)| *j != i).map(|(_, &v)| v)).max().unwrap_or(1).max(1);
-                for i in 0..10 {
-                    p.text(o + egui::vec2(-6.0, (i as f32 + 0.5) * cell), egui::Align2::RIGHT_CENTER, names[i], egui::FontId::proportional(12.0), MUTED);
-                    p.text(o + egui::vec2((i as f32 + 0.5) * cell, -4.0), egui::Align2::CENTER_BOTTOM, short(names[i]), egui::FontId::proportional(11.0), MUTED);
+                let fs = (cell * 0.28).clamp(8.0, 11.0);
+                for i in 0..k {
+                    p.text(o + egui::vec2(-6.0, (i as f32 + 0.5) * cell), egui::Align2::RIGHT_CENTER, short(&names[i], 11), egui::FontId::proportional(fs + 1.0), MUTED);
+                    if cell >= 24.0 {
+                        p.text(o + egui::vec2((i as f32 + 0.5) * cell, -4.0), egui::Align2::CENTER_BOTTOM, short(&names[i], 4), egui::FontId::proportional(fs), MUTED);
+                    }
                     let row: u32 = ev.confusion[i].iter().sum();
-                    for j in 0..10 {
+                    for j in 0..k {
                         let v = ev.confusion[i][j];
-                        let r = egui::Rect::from_min_size(o + egui::vec2(j as f32 * cell, i as f32 * cell), egui::vec2(cell - 2.0, cell - 2.0));
+                        let r = egui::Rect::from_min_size(o + egui::vec2(j as f32 * cell, i as f32 * cell), egui::vec2(cell - 1.5, cell - 1.5));
                         let col = if i == j {
                             let t = v as f32 / row.max(1) as f32;
                             Color32::from_rgb((20.0 + 40.0 * t) as u8, (40.0 + 130.0 * t) as u8, (30.0 + 40.0 * t) as u8)
@@ -1256,34 +1602,35 @@ impl App {
                             let t = ((v as f32).ln_1p() / (maxoff as f32).ln_1p()).clamp(0.15, 1.0);
                             Color32::from_rgb((60.0 + 180.0 * t) as u8, (30.0 + 40.0 * t) as u8, (30.0 + 30.0 * t) as u8)
                         };
-                        p.rect_filled(r, 3.0, col);
-                        if v > 0 {
-                            p.text(r.center(), egui::Align2::CENTER_CENTER, v.to_string(), egui::FontId::monospace(11.0), Color32::WHITE);
+                        p.rect_filled(r, 2.0, col);
+                        if v > 0 && cell >= 22.0 {
+                            p.text(r.center(), egui::Align2::CENTER_CENTER, v.to_string(), egui::FontId::monospace(fs), Color32::WHITE);
                         }
                     }
                     let rec = ev.confusion[i][i] as f32 / row.max(1) as f32;
-                    p.text(o + egui::vec2(10.0 * cell + 6.0, (i as f32 + 0.5) * cell), egui::Align2::LEFT_CENTER, format!("{:.1} %", rec * 100.0), egui::FontId::monospace(11.0), if rec > 0.98 { GREEN } else { ACCENT });
+                    p.text(o + egui::vec2(k as f32 * cell + 6.0, (i as f32 + 0.5) * cell), egui::Align2::LEFT_CENTER, format!("{:.1} %", rec * 100.0), egui::FontId::monospace(fs), if rec > 0.98 { GREEN } else { ACCENT });
                 }
                 ui.label(RichText::new("Rechts daneben: Recall (Trefferquote) pro Klasse.").small().color(MUTED));
             });
             ui.separator();
             ui.vertical(|ui| {
-                ui.label(RichText::new(format!("Fehlklassifikationen: die {} überzeugtesten Irrtümer. Klick = im Netz ansehen.", ev.wrong.len().min(120))).strong());
-                let Some(ds) = ds else { return };
+                tlabel(ui, &mut self.topic, RichText::new(format!("Fehlklassifikationen: die {} überzeugtesten Irrtümer. Klick = im Netz ansehen.", ev.wrong.len().min(120))).strong(), Topic::ViewErrors);
                 egui::ScrollArea::vertical().id_salt("wrong").auto_shrink(false).show(ui, |ui| {
                     let cols = ((ui.available_width() / 96.0) as usize).max(1);
                     egui::Grid::new("wg").spacing(egui::vec2(6.0, 6.0)).show(ui, |ui| {
-                        for (k, &(idx, pred, truth, conf)) in ev.wrong.iter().take(120).enumerate() {
+                        for (n, &(idx, pred, truth, conf)) in ev.wrong.iter().take(120).enumerate() {
                             ui.vertical(|ui| {
-                                let t = self.tex.get(&ctx, &format!("wrong{k}"), idx as u64 * 31 + 7, || viz::digit(ds.test_image(idx), SIDE));
+                                let mut hh = std::collections::hash_map::DefaultHasher::new();
+                                (idx, &ds.spec).hash(&mut hh);
+                                let t = self.tex.get(&ctx, &format!("wrong{n}"), hh.finish(), || viz::sample(ds.test_image(idx), ds.c, ds.h, ds.w));
                                 let r = ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), egui::vec2(84.0, 84.0))).sense(Sense::click()));
-                                if r.on_hover_text(format!("Testbild {idx}")).clicked() {
+                                if r.on_hover_text(format!("Testbild {idx}: {} als {} erkannt", names[truth as usize], names[pred as usize])).clicked() {
                                     self.probe = Probe::Test(idx);
                                     self.tab = Tab::Netz;
                                 }
-                                ui.label(RichText::new(format!("{}→{} {:.0}%", short(names[truth as usize]), short(names[pred as usize]), conf * 100.0)).small().monospace());
+                                ui.label(RichText::new(format!("{}→{} {:.0}%", short(&names[truth as usize], 5), short(&names[pred as usize], 5), conf * 100.0)).small().monospace());
                             });
-                            if (k + 1) % cols == 0 {
+                            if (n + 1) % cols == 0 {
                                 ui.end_row();
                             }
                         }
@@ -1294,10 +1641,6 @@ impl App {
     }
 }
 
-fn short(s: &str) -> String {
-    s.chars().take(5).collect()
-}
-
 // ---------------------------------------------------------------------------
 // Tab: Zeichnen
 // ---------------------------------------------------------------------------
@@ -1305,6 +1648,11 @@ fn short(s: &str) -> String {
 impl App {
     fn tab_zeichnen(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.cfg.dataset.shape() != (1, 28, 28) && self.model().is_some_and(|m| m.0.input != Shape::new(1, 28, 28)) {
+            ui.add_space(30.0);
+            ui.label(RichText::new("Zeichnen funktioniert nur mit Datensätzen aus 1×28×28-Graustufenbildern (MNIST, Fashion-MNIST, KMNIST, EMNIST).").size(16.0));
+            return;
+        }
         ui.label(RichText::new("Male eine Ziffer mit der Maus. Sie wird wie MNIST aufbereitet (in 20×20 eingepasst, Schwerpunkt zentriert) und live klassifiziert.").color(MUTED));
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
@@ -1312,6 +1660,7 @@ impl App {
                 let (resp, painter) = ui.allocate_painter(egui::vec2(size, size), Sense::drag());
                 let rect = resp.rect;
                 if resp.dragged() || resp.drag_started() {
+                    self.topic = Topic::ViewDrawing;
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let p = (pos - rect.min) / size * draw::N as f32;
                         self.canvas.stroke_to(p.x, p.y);
@@ -1343,23 +1692,112 @@ impl App {
                 }
                 let prev = self.probe;
                 self.probe = Probe::Drawing;
-                let res = self.trace().map(|(t, _, cfg, trained)| (t.img.clone(), t.probs.clone(), cfg.dataset, trained, t.key));
+                let res = self.trace().map(|(t, _, cfg, trained, ds)| (t.img.clone(), t.probs.clone(), cfg.dataset.kind(), trained, t.key, ds));
                 self.probe = prev;
-                let Some((img, probs, kind, trained, key)) = res else { return };
+                let (img, probs, kind, trained, key, ds) = match res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ui.label(e);
+                        return;
+                    }
+                };
                 ui.label(RichText::new("Aufbereitet (28×28)").strong());
-                let t = self.tex.get(&ctx, "draw28", key, || viz::digit(&img, SIDE));
+                let t = self.tex.get(&ctx, "draw28", key, || viz::sample(&img, 1, 28, 28));
                 image(ui, &t, 168.0, 168.0);
                 if !trained {
                     ui.label(RichText::new("Das Netz ist noch untrainiert.").color(ACCENT));
                 }
-                if kind == DatasetKind::Fashion {
-                    ui.label(RichText::new("Hinweis: Das Netz wurde auf Fashion-MNIST trainiert.").color(ACCENT));
+                if kind != data::DataKind::Digits {
+                    ui.label(RichText::new(format!("Hinweis: Das Netz kennt die Klassen von „{}“.", ds.name)).color(ACCENT));
                 }
-                let names = kind.class_names();
-                let pred = (0..10).max_by(|&a, &b| probs[a].total_cmp(&probs[b])).unwrap_or(0);
-                ui.label(RichText::new(format!("Vorhersage: {}", names[pred])).size(26.0).strong().color(GREEN));
-                bar_probs(ui, &probs, &names, None, 220.0);
+                let pred = argmax(&probs);
+                ui.label(RichText::new(format!("Vorhersage: {}", ds.classes.get(pred).map(|s| s.as_str()).unwrap_or("?"))).size(26.0).strong().color(GREEN));
+                bar_probs(ui, &probs, &ds.classes, None, 220.0);
             });
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tab: Berater
+// ---------------------------------------------------------------------------
+
+impl App {
+    fn advice_list(&mut self, ui: &mut egui::Ui, list: Vec<Advice>, id: &str) {
+        let mut apply: Option<Box<dyn Fn(&mut TrainConfig)>> = None;
+        let mut label = String::new();
+        for (n, a) in list.into_iter().enumerate() {
+            let (icon, col) = match a.level {
+                Level::Error => ("⛔", RED),
+                Level::Warn => ("⚠", ACCENT),
+                Level::Tip => ("💡", BLUE),
+                Level::Good => ("✔", GREEN),
+            };
+            egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon).size(16.0).color(col));
+                    ui.label(RichText::new(&a.title).strong().color(col).size(15.0));
+                });
+                ui.label(&a.text);
+                ui.horizontal(|ui| {
+                    if let Some(f) = a.fix {
+                        let running = self.tr.running();
+                        if ui.add_enabled(!running, egui::Button::new(RichText::new(format!("✔ {}", f.label)).color(GREEN))).on_hover_text("Übernimmt die Korrektur in die Konfiguration (gilt ab dem nächsten Training).").clicked() {
+                            label = f.label.clone();
+                            apply = Some(f.apply);
+                        }
+                    }
+                    if ui.push_id((id, n), |ui| ui.button("🎓 Erklärung")).inner.clicked() {
+                        self.topic = a.topic;
+                        self.show_tutorial = true;
+                    }
+                });
+            });
+        }
+        if let Some(f) = apply {
+            f(&mut self.cfg);
+            self.info_line = Some(format!("Berater: „{label}“ übernommen."));
+        }
+    }
+
+    fn tab_berater(&mut self, ui: &mut egui::Ui) {
+        let info = self.data_info();
+        let running = self.tr.running();
+        egui::ScrollArea::vertical().id_salt("berater").auto_shrink(false).show(ui, |ui| {
+            // Empfehlung für den Datensatz
+            let (recipe, why) = advisor::ideal(&info);
+            egui::Frame::new().fill(Color32::from_rgb(28, 36, 30)).corner_radius(6.0).inner_margin(12.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(format!("Empfehlung für {}", self.cfg.dataset.label())).size(17.0).strong().color(GREEN));
+                ui.label(why);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Passende Voreinstellung:").color(MUTED));
+                    ui.label(RichText::new(recipe).strong());
+                    if ui.add_enabled(!running, egui::Button::new(RichText::new("✔ Übernehmen").color(GREEN))).clicked() {
+                        self.apply_recipe(recipe);
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.label(RichText::new("Aktuelle Konfiguration").size(16.0).strong());
+            let list = advisor::check_config(&self.cfg, &info, &self.preview, self.cores);
+            self.advice_list(ui, list, "cfg");
+
+            let (hist_len, list) = {
+                let s = self.tr.shared.lock().unwrap();
+                let k = s.model.as_ref().map(|m| m.classes).unwrap_or(10);
+                (s.hist.loss.len(), advisor::check_training(&s.cfg, &s.hist, &s.status, &s.layer_names, &s.param_layers, k, s.cfg.dataset.kind()))
+            };
+            ui.add_space(10.0);
+            ui.label(RichText::new("Letzter Trainingslauf").size(16.0).strong());
+            if hist_len < 30 && list.is_empty() {
+                ui.label(RichText::new("Noch kein (ausreichend langer) Lauf. Nach dem Training erkennt der Berater hier Overfitting, Underfitting, verschwindende Gradienten, tote ReLUs und eine falsch gewählte Lernrate.").color(MUTED));
+            } else if list.is_empty() {
+                ui.label(RichText::new("Keine Auffälligkeiten im Verlauf.").color(GREEN));
+            } else {
+                self.advice_list(ui, list, "train");
+            }
         });
     }
 }

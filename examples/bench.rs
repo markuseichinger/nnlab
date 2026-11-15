@@ -16,7 +16,7 @@ fn main() {
         cfg.train_size = n;
     }
     if args.iter().any(|a| a == "fashion") {
-        cfg.dataset = nnlab::data::DatasetKind::Fashion;
+        cfg.dataset = nnlab::data::DataSpec::fashion();
     }
     cfg.layers = match arch {
         "cnn" => vec![

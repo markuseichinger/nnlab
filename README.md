@@ -3,7 +3,24 @@
 Eine Lern-App für Leute, die wissen wollen, was beim Training eines neuronalen
 Netzes wirklich passiert. Alles läuft echt: eigene Implementierung von
 Vorwärtsrechnung, Backpropagation und Optimierern in Rust, ohne ML-Bibliothek.
-Trainiert wird auf MNIST (Ziffern) oder Fashion-MNIST.
+Trainiert wird auf MNIST, Fashion-MNIST oder jedem Bildklassifikations-Datensatz
+von Hugging Face (z. B. KMNIST, EMNIST, CIFAR-10, EuroSAT).
+
+## Lernhilfen
+
+- **Voreinstellungen:** Komplette, durchdachte Konfigurationen („Empfohlen“) und
+  Lehrbeispiele, die einen typischen Fehler vorführen (Vanishing Gradients, zu
+  hohe Lernrate, Overfitting, Null-Initialisierung, tote ReLUs …). Ein Rezept
+  setzt alles zurück, nur Datensatz und Threads bleiben.
+- **Berater:** Prüft die Konfiguration mit Praxisregeln (Lernrate passend zum
+  Optimierer, fehlende Aktivierungen, Init vs. Aktivierung, Regularisierung bei
+  wenig Daten, BatchNorm mit kleinen Batches …) und wertet nach dem Training den
+  Verlauf aus (Overfitting, Underfitting, verschwindende Gradienten, tote ReLUs,
+  Update-Verhältnis). Korrekturen lassen sich per Klick übernehmen. Oben steht die
+  empfohlene Einstellung für den gewählten Datensatz.
+- **Tutorial-Modus:** Ein Klick auf einen Parameter, einen Tab oder ein Diagramm
+  zeigt rechts, was er tut, die Mathematik dahinter, übliche Werte, was man
+  beobachten kann, und einen Kommentar zur aktuellen Einstellung.
 
 ## Starten
 
@@ -21,7 +38,8 @@ cargo run --release --example bench -- cnn 3 8     # Architektur, Epochen, Threa
 cargo run --release --example bench -- mlp 5 8 60000 fashion
 ```
 
-Die Korrektheit der Backpropagation prüfen (Vergleich mit numerischer Ableitung):
+Tests: Backpropagation gegen numerische Ableitung, Hugging-Face-Import mit
+nachgebauten Parquet-Dateien, Ende-zu-Ende-Training auf Farbbildern:
 
 ```
 cargo test --release
@@ -29,8 +47,10 @@ cargo test --release
 
 ## Was man einstellen kann
 
-- **Daten:** MNIST oder Fashion-MNIST, Größe des Trainingssets (klein = Overfitting),
-  Normierung, Augmentierung durch zufälliges Verschieben
+- **Daten:** MNIST, Fashion-MNIST oder ein Hugging-Face-Datensatz (ID eingeben,
+  Bildgröße und Farbe wählen; Voraussetzung: eine Spalte vom Typ Image und eine vom
+  Typ ClassLabel). Größe des Trainingssets (klein = Overfitting), Normierung,
+  Augmentierung durch Verschieben und Spiegeln
 - **Architektur:** beliebige Folge aus Dense, Conv2D (k×k, same/valid), MaxPool,
   BatchNorm, Dropout und Aktivierungen (ReLU, LeakyReLU, Sigmoid, Tanh, GELU);
   am Ende immer Dense(10) + Softmax. Vorlagen für typische Experimente.
@@ -75,9 +95,12 @@ cargo test --release
 | Datei | Inhalt |
 |---|---|
 | `src/nn.rs` | Schichten, Backpropagation, Verlust, Optimierer, Gradiententests |
-| `src/data.rs` | Download, IDX-Format, Normierung, Augmentierung |
+| `src/data.rs` | MNIST/Fashion (IDX), Hugging Face (Parquet), Cache, Normierung, Augmentierung |
 | `src/trainer.rs` | Trainingsschleife im Hintergrund-Thread, Metriken |
 | `src/main.rs` | Oberfläche (egui) |
+| `src/presets.rs` | Voreinstellungen und Lehrbeispiele |
+| `src/advisor.rs` | Berater: Regeln, Trainingsdiagnose, Empfehlung pro Datensatz |
+| `src/tutorial.rs` | Erklärtexte für Tutorial-Modus |
 | `src/viz.rs`, `src/draw.rs` | Farbskalen, Kachelbilder, Zeichenfläche |
 
 Matrixprodukte laufen über `matrixmultiply` (SIMD, auf Apple Silicon NEON),
