@@ -1,0 +1,14 @@
+[package]
+name = "nnlab"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "7.0.0"
+eframe = "0.37.0"
+egui_plot = "0.38.0"
+flate2 = "1.1.11"
+matrixmultiply = "0.3.11"
+rayon = "1.12.0"
+ureq = "3.5.2"
+
