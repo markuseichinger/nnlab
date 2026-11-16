@@ -58,6 +58,7 @@ pub enum Topic {
     ViewConfusion,
     ViewErrors,
     ViewDrawing,
+    ViewGraph,
 }
 
 pub struct Doc {
@@ -83,7 +84,7 @@ pub fn index() -> Vec<(&'static str, Vec<Topic>)> {
         ("Initialisierung & Verlust", vec![Init, Loss, LabelSmoothing]),
         ("Optimierung", vec![Optimizer, Sgd, Momentum, RmsProp, Adam, LearningRate, Betas, Epsilon, WeightDecay, GradClip]),
         ("Ablauf", vec![Schedule, Warmup, Epochs, BatchSize, Threads, Seed, EvalEvery, LiveLr, SlowMo, StepMode, Throughput]),
-        ("Ansichten", vec![ViewLoss, ViewAcc, ViewGradNorm, ViewUpdateRatio, ViewActStats, ViewActivations, ViewWeights, ViewHistogram, ViewConfusion, ViewErrors, ViewDrawing]),
+        ("Ansichten", vec![ViewGraph, ViewLoss, ViewAcc, ViewGradNorm, ViewUpdateRatio, ViewActStats, ViewActivations, ViewWeights, ViewHistogram, ViewConfusion, ViewErrors, ViewDrawing]),
     ]
 }
 
@@ -488,6 +489,14 @@ pub fn doc(t: Topic) -> Doc {
             typical: "Viele davon sind auch für Menschen mehrdeutig oder falsch gelabelt.",
             watch: "Sehr sichere Fehler (über 99 %) deuten auf ein überkonfidentes Modell. Label Smoothing kann das mildern.",
             related: &[ViewConfusion, LabelSmoothing],
+        },
+        ViewGraph => Doc {
+            title: "Netzgraph",
+            what: "Das Netz als Graph: Spalten sind Schichten, Kreise sind Neuronen, kleine Bilder sind Kanäle einer Faltung (Feature-Maps), Linien sind Gewichte. Eine Spalte fasst eine lineare Schicht mit der folgenden Aktivierung, BatchNorm, Pooling und Dropout zusammen. Die Füllfarbe eines Knotens zeigt seine Aktivierung für das gewählte Bild. Alles wird während des Trainings laufend aus dem echten Modell aktualisiert.\n\nVier Ansichten der Kanten: Gewichte (was das Netz gelernt hat), Signalfluss w·a (welche Pfade bei diesem Bild die Entscheidung tragen), Gradienten (wohin das Netz gerade ziehen will) und Änderung live (wo es in diesem Moment lernt).",
+            math: "Signalfluss: Beitrag von Quelle i zu Ziel j = w_ji · a_i\nZiel-Eingang z_j = Σ_i w_ji · a_i + b_j\nFaltung: Kante = ‖W[o,c,:,:]‖ mit Vorzeichen der Summe",
+            typical: "Pro Neuron werden nur die stärksten Kanten gezeichnet, sonst wäre der Graph schwarz. Bei großen Schichten wird eine Auswahl gezeigt. Die Kantenstärke ist je Schichtpaar normiert.",
+            watch: "„Änderung live“ während des Trainings ansehen: Am Anfang leuchtet alles, später nur noch wenige Verbindungen. Ein Klick auf ein Ausgabeneuron zeigt alle eingehenden Pfade. Im Signalfluss bei einem Fehler nachsehen, welche Neuronen für die falsche Klasse gestimmt haben. Der Balken unter jeder Überschrift zeigt die Lernaktivität ‖ΔW‖/‖W‖ der Schicht.",
+            related: &[ViewActivations, ViewWeights, ViewUpdateRatio],
         },
         ViewDrawing => Doc {
             title: "Zeichnen",

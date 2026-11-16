@@ -2,6 +2,7 @@
 
 mod advisor;
 mod draw;
+mod graph;
 mod presets;
 mod tutorial;
 mod viz;
@@ -43,6 +44,7 @@ enum Tab {
     Auswertung,
     Zeichnen,
     Berater,
+    Graph,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,6 +157,7 @@ struct App {
     hf_id: String,
     hf_side: usize,
     hf_rgb: bool,
+    g: GraphUi,
 }
 
 impl App {
@@ -186,6 +189,7 @@ impl App {
             hf_id: String::new(),
             hf_side: 32,
             hf_rgb: true,
+            g: GraphUi::default(),
         };
         app.ensure_data();
         app
@@ -345,6 +349,7 @@ impl eframe::App for App {
             ui.horizontal_wrapped(|ui| {
                 for (t, name, topic) in [
                     (Tab::Verlauf, "📈 Verlauf", Topic::ViewLoss),
+                    (Tab::Graph, "🕸 Netzgraph", Topic::ViewGraph),
                     (Tab::Netz, "🔍 Netz & Aktivierungen", Topic::ViewActivations),
                     (Tab::Gewichte, "▦ Gewichte", Topic::ViewWeights),
                     (Tab::Dynamik, "〰 Gradienten-Dynamik", Topic::ViewGradNorm),
@@ -365,6 +370,7 @@ impl eframe::App for App {
                 Tab::Auswertung => self.tab_auswertung(ui),
                 Tab::Zeichnen => self.tab_zeichnen(ui),
                 Tab::Berater => self.tab_berater(ui),
+                Tab::Graph => self.tab_graph(ui),
             }
         });
     }
@@ -1798,6 +1804,330 @@ impl App {
             } else {
                 self.advice_list(ui, list, "train");
             }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tab: Netzgraph
+// ---------------------------------------------------------------------------
+
+struct GraphUi {
+    mode: graph::EdgeMode,
+    max_nodes: usize,
+    top_k: usize,
+    pick: graph::Pick,
+    sel: Option<(usize, usize)>,
+    cur: Option<(u64, Arc<Model>)>,
+    prev: Option<Arc<Model>>,
+}
+
+impl Default for GraphUi {
+    fn default() -> Self {
+        Self { mode: graph::EdgeMode::Weight, max_nodes: 24, top_k: 6, pick: graph::Pick::Spread, sel: None, cur: None, prev: None }
+    }
+}
+
+/// Lernaktivität ‖ΔW‖/‖W‖ als Farbe und Balkenanteil (log-Skala 1e-6 … 1e-1).
+fn activity(r: f64) -> (f32, Color32) {
+    let t = ((r.max(1e-9).log10() + 6.0) / 5.0).clamp(0.0, 1.0) as f32;
+    let col = if r > 1e-2 { RED } else if r > 3e-4 { GREEN } else if r > 3e-5 { ACCENT } else { MUTED };
+    (t, col)
+}
+
+impl App {
+    fn tab_graph(&mut self, ui: &mut egui::Ui) {
+        // Steuerung
+        let full_w = ui.available_width();
+        ui.horizontal(|ui| {
+            let t = &mut self.topic;
+            combo(ui, "gmode", "Kanten:", &mut self.g.mode, &graph::EdgeMode::ALL, |m| m.name(), t, Topic::ViewGraph);
+            combo(ui, "gpick", "Auswahl:", &mut self.g.pick, &[graph::Pick::Spread, graph::Pick::Active], |p| if p == graph::Pick::Spread { "gleichmäßig verteilt" } else { "aktivste für dieses Bild" }, t, Topic::ViewGraph);
+        });
+        ui.horizontal(|ui| {
+            let t = &mut self.topic;
+            tlabel(ui, t, "Knoten je Schicht:", Topic::ViewGraph);
+            tp(t, ui.add(egui::Slider::new(&mut self.g.max_nodes, 4..=64)), Topic::ViewGraph);
+            ui.add_space(12.0);
+            tlabel(ui, t, "Kanten je Neuron:", Topic::ViewGraph);
+            tp(t, ui.add(egui::Slider::new(&mut self.g.top_k, 1..=64)), Topic::ViewGraph);
+        });
+        self.probe_selector(ui);
+        let ctx = ui.ctx().clone();
+        let ver = self.model().map(|m| m.1).unwrap_or(0);
+        let (key, outs, input, probs, model, trained, ds) = match self.trace() {
+            Ok((tr, model, _cfg, trained, ds)) => (tr.key, tr.outs.clone(), tr.input.clone(), tr.probs.clone(), model, trained, ds),
+            Err(e) => {
+                ui.add_space(30.0);
+                ui.label(RichText::new(e).size(16.0));
+                return;
+            }
+        };
+        // Vorigen Schnappschuss merken (für „Änderung live“)
+        if self.g.cur.as_ref().map(|c| c.0) != Some(ver) {
+            self.g.prev = self.g.cur.take().map(|c| c.1);
+            self.g.cur = Some((ver, model.clone()));
+        }
+        let prev = self.g.prev.clone().filter(|p| p.layers.len() == model.layers.len());
+        let cols = graph::columns(&model, &input, &outs, &probs, self.g.max_nodes, self.g.pick);
+        if self.g.sel.is_some_and(|(c, n)| c >= cols.len() || n >= cols[c].idx.len()) {
+            self.g.sel = None;
+        }
+        let sel = self.g.sel;
+        let mode = self.g.mode;
+        let names = &ds.classes;
+        // Lernaktivität pro Schicht aus dem Verlauf
+        let act: Vec<Option<f64>> = {
+            let s = self.tr.shared.lock().unwrap();
+            cols.iter().map(|c| c.layer.and_then(|li| s.hist.upd_ratio.get(li).and_then(|v| v.last()).map(|p| p[1]))).collect()
+        };
+        let hint = match (mode, trained, prev.is_some()) {
+            (graph::EdgeMode::Change, false, _) => Some("Die Änderung erscheint, sobald das Training läuft."),
+            (graph::EdgeMode::Change, true, false) => Some("Die Änderung erscheint ab dem zweiten Schnappschuss (läuft das Training?)."),
+            (graph::EdgeMode::Gradient, false, _) => Some("Gradienten gibt es erst nach dem ersten Trainingsschritt."),
+            _ => None,
+        };
+        if let Some(h) = hint {
+            ui.label(RichText::new(h).color(ACCENT));
+        }
+
+        // Zeichenfläche
+        let detail_h = if sel.is_some() { 190.0 } else { 0.0 };
+        let size = egui::vec2(full_w.min(ui.clip_rect().right() - ui.cursor().left()), (ui.available_height() - detail_h - 8.0).max(260.0));
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 6.0, Color32::from_rgb(16, 17, 21));
+        let n = cols.len();
+        let (left, right) = (rect.left() + 60.0, rect.right() - 170.0);
+        let top = rect.top() + 64.0;
+        let bottom = rect.bottom() - 40.0;
+        let gap = if n > 1 { (right - left) / (n - 1) as f32 } else { 0.0 };
+        // Knotenpositionen und Größen
+        struct NodePos {
+            c: egui::Pos2,
+            half: f32,
+        }
+        let mut pos: Vec<Vec<NodePos>> = Vec::new();
+        for (ci, col) in cols.iter().enumerate() {
+            let m = col.idx.len().max(1);
+            let x = left + ci as f32 * gap;
+            let spacing = (bottom - top) / m as f32;
+            let half = if col.spatial() { ((spacing - 4.0) / 2.0).min(if ci == 0 { 60.0 } else { 26.0 }).min(gap * 0.22).max(3.0) } else { (spacing * 0.36).clamp(2.5, 11.0) };
+            pos.push((0..m).map(|j| NodePos { c: egui::pos2(x, top + (j as f32 + 0.5) * spacing), half }).collect());
+        }
+        // Kanten
+        for b in 1..n {
+            let es = graph::edges(&model, prev.as_deref(), &cols, b, mode, self.g.top_k, sel);
+            let mx = es.iter().map(|e| e.2.abs()).fold(0.0f32, f32::max).max(1e-12);
+            for &(si, dj, v) in &es {
+                let t = (v.abs() / mx).powf(0.8);
+                let touches = sel.is_some_and(|(sc, sn)| (sc == b - 1 && sn == si) || (sc == b && sn == dj));
+                let dim = sel.is_some() && !touches;
+                let base = match mode {
+                    graph::EdgeMode::Change => Color32::from_rgb(220, 240, 90),
+                    _ if v >= 0.0 => ACCENT,
+                    _ => BLUE,
+                };
+                let alpha = ((15.0 + 225.0 * t) * if dim { 0.12 } else { 1.0 }) as u8;
+                let col = Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha);
+                let (a, z) = (&pos[b - 1][si], &pos[b][dj]);
+                let p0 = egui::pos2(a.c.x + a.half, a.c.y);
+                let p1 = egui::pos2(z.c.x - z.half, z.c.y);
+                painter.line_segment([p0, p1], egui::Stroke::new(0.4 + 2.6 * t * if touches { 1.3 } else { 1.0 }, col));
+            }
+        }
+        // Knoten
+        let mut hover: Option<(usize, usize)> = None;
+        let pointer = resp.hover_pos();
+        for (ci, col) in cols.iter().enumerate() {
+            let x = left + ci as f32 * gap;
+            // Kopf: Titel, Details, Lernaktivität
+            let tcol = if col.is_output { GREEN } else if col.layer.is_some() { layer_color(&model.layers[col.layer.unwrap()]) } else { MUTED };
+            painter.text(egui::pos2(x, rect.top() + 6.0), egui::Align2::CENTER_TOP, &col.title, egui::FontId::proportional(13.0), tcol);
+            painter.text(egui::pos2(x, rect.top() + 22.0), egui::Align2::CENTER_TOP, &col.detail, egui::FontId::proportional(10.0), MUTED);
+            if let Some(r) = act[ci] {
+                let (t, c) = activity(r);
+                let bar = egui::Rect::from_min_size(egui::pos2(x - 30.0, rect.top() + 38.0), egui::vec2(60.0, 5.0));
+                painter.rect_filled(bar, 2.0, Color32::from_gray(40));
+                painter.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(60.0 * t, 5.0)), 2.0, c);
+                painter.text(egui::pos2(x, rect.top() + 45.0), egui::Align2::CENTER_TOP, format!("ΔW/W {r:.0e}"), egui::FontId::proportional(9.0), c);
+            }
+            if col.n_total > col.idx.len() {
+                painter.text(egui::pos2(x, bottom + 4.0), egui::Align2::CENTER_TOP, format!("{} von {}", col.idx.len(), col.n_total), egui::FontId::proportional(10.0), MUTED);
+            }
+            if col.spatial() {
+                // Feature-Maps als Kacheln aus einem Atlas
+                let (h, w) = (col.shape.h, col.shape.w);
+                let all: Vec<f32> = col.maps.iter().flatten().copied().collect();
+                let sc = viz::Scale::auto(&all);
+                let m = col.maps.len();
+                let mut hh = std::collections::hash_map::DefaultHasher::new();
+                (key, ci, &col.idx).hash(&mut hh);
+                let tex = self.tex.get(&ctx, &format!("gcol{ci}"), hh.finish(), || {
+                    if ci == 0 && ds.c == 3 {
+                        // Eingabe in Farbe: das Originalbild dreimal (je Kanal eingefärbt)
+                        let hw = h * w;
+                        let mut px = Vec::with_capacity(hw * 3);
+                        for c in 0..3 {
+                            let mx = col.maps[c].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let mn = col.maps[c].iter().cloned().fold(f32::INFINITY, f32::min);
+                            for &v in &col.maps[c] {
+                                let t = ((v - mn) / (mx - mn).max(1e-6) * 255.0) as u8;
+                                px.push(match c {
+                                    0 => Color32::from_rgb(t, 0, 0),
+                                    1 => Color32::from_rgb(0, t, 0),
+                                    _ => Color32::from_rgb(0, 0, t),
+                                });
+                            }
+                        }
+                        ColorImage::new([w, h * 3], px)
+                    } else {
+                        ColorImage::new([w, h * m], all.iter().map(|&v| sc.color(v)).collect())
+                    }
+                });
+                for j in 0..m {
+                    let p = &pos[ci][j];
+                    let r = egui::Rect::from_center_size(p.c, egui::vec2(2.0 * p.half, 2.0 * p.half * h as f32 / w as f32));
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, j as f32 / m as f32), egui::pos2(1.0, (j + 1) as f32 / m as f32));
+                    painter.image(tex.id(), r, uv, Color32::WHITE);
+                    let selected = sel == Some((ci, j));
+                    painter.rect_stroke(r, 1.0, egui::Stroke::new(if selected { 2.0 } else { 0.6 }, if selected { Color32::WHITE } else { Color32::from_gray(90) }), egui::StrokeKind::Outside);
+                    if pointer.is_some_and(|q| r.expand(2.0).contains(q)) {
+                        hover = Some((ci, j));
+                    }
+                }
+            } else {
+                let sc = viz::Scale::auto(&col.val);
+                let pred = argmax(&col.val);
+                for (j, &v) in col.val.iter().enumerate() {
+                    let p = &pos[ci][j];
+                    let fill = if col.is_output { Color32::from_rgb((30.0 + 90.0 * v) as u8, (40.0 + 169.0 * v) as u8, (40.0 + 41.0 * v) as u8) } else { sc.color(v) };
+                    let selected = sel == Some((ci, j));
+                    painter.circle(p.c, p.half, fill, egui::Stroke::new(if selected { 2.5 } else { 0.8 }, if selected { Color32::WHITE } else { Color32::from_gray(110) }));
+                    if col.is_output {
+                        let k = col.idx[j];
+                        let name = names.get(k).cloned().unwrap_or_default();
+                        let c = if j == pred { GREEN } else { Color32::from_gray(190) };
+                        painter.text(egui::pos2(p.c.x + p.half + 6.0, p.c.y), egui::Align2::LEFT_CENTER, format!("{} {:>5.1} %", short(&name, 12), v * 100.0), egui::FontId::monospace(11.0), c);
+                        let bar = egui::Rect::from_min_size(egui::pos2(p.c.x + p.half + 6.0, p.c.y + 6.0), egui::vec2(120.0 * v, 3.0));
+                        painter.rect_filled(bar, 1.0, c);
+                    }
+                    if pointer.is_some_and(|q| q.distance(p.c) <= p.half.max(5.0) + 2.0) {
+                        hover = Some((ci, j));
+                    }
+                }
+            }
+        }
+        // Legende
+        let legend = match mode {
+            graph::EdgeMode::Weight => "Kante: orange = positives, blau = negatives Gewicht; Dicke = Betrag (je Schichtpaar normiert). Bei Faltungen fasst eine Kante einen k×k-Filter zusammen.",
+            graph::EdgeMode::Signal => "Kante: Beitrag w · a zum Eingang des Zielneurons für das gezeigte Bild. Orange erregt, blau hemmt. Zeigt, welche Pfade die Entscheidung tragen.",
+            graph::EdgeMode::Gradient => "Kante: letzter Gradient ∂L/∂w. Orange = Gewicht wird verkleinert, blau = vergrößert. Wo es leuchtet, will das Netz gerade etwas ändern.",
+            graph::EdgeMode::Change => "Kante: wie stark sich das Gewicht seit dem vorigen Schnappschuss (ca. 0,2 s) verändert hat. Hier sieht man, wo das Netz gerade lernt.",
+        };
+        painter.text(egui::pos2(rect.left() + 8.0, rect.bottom() - 6.0), egui::Align2::LEFT_BOTTOM, legend, egui::FontId::proportional(10.5), MUTED);
+
+        // Hover-Info
+        if let (Some((ci, j)), Some(q)) = (hover, pointer) {
+            let col = &cols[ci];
+            let k = col.idx[j];
+            let mut txt = if col.is_output { format!("Klasse {} „{}“\np = {:.2} %", k, names.get(k).cloned().unwrap_or_default(), col.val[j] * 100.0) } else if col.spatial() { format!("{} · Kanal {k}\nMittlere Aktivierung {:+.3}", col.title, col.val[j]) } else { format!("{} · Neuron {k}\nAktivierung {:+.3}", col.title, col.val[j]) };
+            txt += "\nKlick = Verbindungen hervorheben";
+            let galley = painter.layout_no_wrap(txt, egui::FontId::proportional(12.0), Color32::WHITE);
+            let r = egui::Rect::from_min_size(q + egui::vec2(14.0, 10.0), galley.size() + egui::vec2(12.0, 8.0));
+            let r = r.translate(egui::vec2((rect.right() - r.right()).min(0.0), (rect.bottom() - r.bottom()).min(0.0)));
+            painter.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(30, 32, 38, 240));
+            painter.galley(r.min + egui::vec2(6.0, 4.0), galley, Color32::WHITE);
+        }
+        if resp.clicked() {
+            self.g.sel = if hover == self.g.sel { None } else { hover };
+            self.topic = Topic::ViewGraph;
+        }
+        if hover.is_some() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        // Details zum ausgewählten Knoten
+        if let Some((ci, j)) = self.g.sel {
+            self.graph_detail(ui, &model, &cols, ci, j, names, ver);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_detail(&mut self, ui: &mut egui::Ui, model: &Model, cols: &[graph::Column], ci: usize, j: usize, names: &[String], ver: u64) {
+        let ctx = ui.ctx().clone();
+        let col = &cols[ci];
+        let k = col.idx[j];
+        egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(300.0);
+                    let what = if col.is_output { format!("Ausgabe „{}“", names.get(k).cloned().unwrap_or_default()) } else if col.spatial() { format!("{} · Kanal {k}", col.title) } else if col.layer.is_none() { format!("Eingabekanal {k}") } else { format!("{} · Neuron {k}", col.title) };
+                    ui.label(RichText::new(what).strong().size(15.0));
+                    ui.label(RichText::new(&col.detail).small().color(MUTED));
+                    ui.label(format!("{}: {:+.4}", if col.is_output { "Wahrscheinlichkeit" } else if col.spatial() { "mittlere Aktivierung" } else { "Aktivierung" }, col.val[j]));
+                    if let Some(li) = col.layer {
+                        let ps = model.layers[li].params();
+                        if ps.len() > 1 {
+                            ui.label(format!("Bias: {:+.4}", ps[1].w[k]));
+                        }
+                        // Stärkste eingehende Beiträge (exakt, über alle Quellknoten)
+                        if ci > 0 {
+                            let src = &cols[ci - 1];
+                            let all = graph::Column { idx: (0..src.n_total).collect(), val: Vec::new(), maps: Vec::new(), title: String::new(), detail: String::new(), layer: src.layer, shape: src.shape, n_total: src.n_total, out: src.out.clone(), is_output: false };
+                            let me = graph::Column { idx: vec![k], val: Vec::new(), maps: Vec::new(), title: String::new(), detail: String::new(), layer: col.layer, shape: col.shape, n_total: col.n_total, out: Vec::new(), is_output: false };
+                            let pair = [all, me];
+                            let mut e = graph::edges(model, None, &pair, 1, graph::EdgeMode::Signal, usize::MAX, None);
+                            e.sort_by(|a, b| b.2.abs().total_cmp(&a.2.abs()));
+                            let total: f32 = e.iter().map(|x| x.2).sum();
+                            ui.label(RichText::new(format!("Summe der Eingangsbeiträge: {total:+.3}")).small());
+                            for (si, _, v) in e.iter().take(4) {
+                                let name = if src.spatial() { format!("Kanal {si}") } else if src.layer.is_none() { "Eingabe".into() } else { format!("Neuron {si}") };
+                                ui.label(RichText::new(format!("  {name}: {v:+.3}")).monospace().small().color(if *v >= 0.0 { ACCENT } else { BLUE }));
+                            }
+                        }
+                    }
+                    if ui.small_button("Auswahl aufheben").clicked() {
+                        self.g.sel = None;
+                    }
+                });
+                // Feature-Map groß
+                if col.spatial() {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Feature-Map").small().color(MUTED));
+                        let (h, w) = (col.shape.h, col.shape.w);
+                        let map = &col.maps[j];
+                        let sc = viz::Scale::auto(map);
+                        let mut hh = std::collections::hash_map::DefaultHasher::new();
+                        (ver, ci, k, self.trace.as_ref().map(|t| t.key)).hash(&mut hh);
+                        let t = self.tex.get(&ctx, "gsel_map", hh.finish(), || ColorImage::new([w, h], map.iter().map(|&v| sc.color(v)).collect()));
+                        image(ui, &t, 140.0, 140.0 * h as f32 / w as f32);
+                    });
+                }
+                // Eingehende Gewichte als Bild (rezeptives Feld bzw. Filter)
+                if let Some(li) = col.layer {
+                    if let Some((w, h, c, vals)) = graph::receptive_field(model, li, k) {
+                        ui.vertical(|ui| {
+                            let filt = matches!(model.layers[li], Layer::Conv(_));
+                            ui.label(RichText::new(if filt { format!("Filter ({c} Eingangskanäle à {w}×{h})") } else { "Eingehende Gewichte (rezeptives Feld)".to_string() }).small().color(MUTED));
+                            let hw = w * h;
+                            let img = if c == 3 {
+                                viz::rgb_tiles(1, w, h, 1, |_| max_abs(&vals), |_, ch, x, y| vals[ch * hw + y * w + x])
+                            } else {
+                                let cc = c.min(16);
+                                viz::tiles(cc, w, h, cc.min(8), |_| viz::Scale::Signed(max_abs(&vals)), |t, x, y| vals[t * hw + y * w + x])
+                            };
+                            let mut hh = std::collections::hash_map::DefaultHasher::new();
+                            (ver, li, k).hash(&mut hh);
+                            let (iw, ih) = (img.size[0] as f32, img.size[1] as f32);
+                            let s = (140.0 / ih).min(360.0 / iw);
+                            let t = self.tex.get(&ctx, "gsel_rf", hh.finish(), || img);
+                            image(ui, &t, iw * s, ih * s);
+                        });
+                    }
+                }
+            });
         });
     }
 }

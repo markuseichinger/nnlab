@@ -66,6 +66,12 @@ cargo test --release
 
 ## Was man sieht
 
+- **Netzgraph:** das Netz als Graph aus Neuronen (Kreise), Feature-Maps (Bilder)
+  und Gewichten (Linien), live während des Trainings. Vier Kantenansichten:
+  Gewichte, Signalfluss w·a für das gewählte Bild, Gradienten und „Änderung
+  live“ (wo das Netz gerade lernt). Pro Schicht ein Balken für die
+  Lernaktivität ‖ΔW‖/‖W‖. Klick auf einen Knoten zeigt alle seine Verbindungen,
+  die stärksten Eingangsbeiträge, Feature-Map und Filter bzw. rezeptives Feld.
 - **Verlauf:** Verlust und Genauigkeit (Train/Test), Lernrate, Gradientennorm,
   Generalisierungslücke pro Epoche
 - **Netz & Aktivierungen:** ein Testbild (oder die eigene Zeichnung) läuft durch
@@ -101,6 +107,7 @@ cargo test --release
 | `src/presets.rs` | Voreinstellungen und Lehrbeispiele |
 | `src/advisor.rs` | Berater: Regeln, Trainingsdiagnose, Empfehlung pro Datensatz |
 | `src/tutorial.rs` | Erklärtexte für Tutorial-Modus |
+| `src/graph.rs` | Netzgraph: Spalten, Knotenauswahl, Kantenberechnung |
 | `src/viz.rs`, `src/draw.rs` | Farbskalen, Kachelbilder, Zeichenfläche |
 
 Matrixprodukte laufen über `matrixmultiply` (SIMD, auf Apple Silicon NEON),
